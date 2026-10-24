@@ -1,0 +1,72 @@
+name: Build WrathPrivateHotbar (Windows)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Plugin/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Fetch Dalamud API 15 dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://goatcorp.github.io/dalamud-distrib/latest.zip'
+          $destination = Join-Path $env:APPDATA 'XIVLauncher\addon\Hooks\dev'
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile 'dalamud-latest.zip'
+          Expand-Archive -Path 'dalamud-latest.zip' -DestinationPath $destination -Force
+
+      - name: Build Release DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet build 'Plugin/WrathPrivateHotbar.csproj' -c Release -p:Platform=x64 --nologo
+          if ($LASTEXITCODE -ne 0) { throw "dotnet build failed: $LASTEXITCODE" }
+
+      - name: Package build artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = 'Plugin/bin/x64/Release/WrathPrivateHotbar.dll'
+          $manifest = 'Plugin/WrathPrivateHotbar.json'
+          if (-not (Test-Path $dll)) {
+            Write-Host 'Build output listing:'
+            Get-ChildItem -Path 'Plugin/bin' -Filter '*.dll' -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+            throw "DLL not found: $dll"
+          }
+          if (-not (Test-Path $manifest)) { throw "Manifest not found: $manifest" }
+          $target = 'dist/WrathPrivateHotbar'
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          Copy-Item $dll (Join-Path $target 'WrathPrivateHotbar.dll')
+          Copy-Item $manifest (Join-Path $target 'WrathPrivateHotbar.json')
+          $pdb = 'Plugin/bin/x64/Release/WrathPrivateHotbar.pdb'
+          if (Test-Path $pdb) { Copy-Item $pdb (Join-Path $target 'WrathPrivateHotbar.pdb') }
+          Compress-Archive -Path $target -DestinationPath 'dist/WrathPrivateHotbar-dev.zip' -Force
+          Write-Host 'Package ready: dist/WrathPrivateHotbar-dev.zip'
+
+      - name: Upload compiled DLL (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: WrathPrivateHotbar-2.0.5.4-dev
+          path: dist/WrathPrivateHotbar-dev.zip
+          if-no-files-found: error
+          retention-days: 14
