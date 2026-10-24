@@ -119,7 +119,7 @@ jobs:
             # Re-upload the corrected latest.zip to the SAME release tag, no version bump required.
             gh release upload $tag 'dist/latest.zip' --repo $repo --clobber
             if ($LASTEXITCODE -ne 0) { throw 'Could not replace existing release asset' }
-            Write-Host "Repaired release $tag: replaced latest.zip"
+            Write-Host "Repaired release ${tag}: replaced latest.zip"
           } else {
             gh release create $tag 'dist/latest.zip' --repo $repo --target main --title "WrathPrivateHotbar $tag" --notes "WrathPrivateHotbar $tag : Dalamud custom repository release." --latest
             if ($LASTEXITCODE -ne 0) { throw 'Could not create release' }
