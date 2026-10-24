@@ -3100,6 +3100,75 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private long lastNpcDialogueVisibleTick;
     private long lastCutsceneVisibleTick;
     private long lastScreenEventWarningTick;
+    // v2.0.5.7: Learn a vanilla hotbar which is actually visible in normal play.
+    // Never mirror a bar hidden by WrathPrivateHotbar itself (usually HB1):
+    // its RootNode is intentionally kept hidden and would suppress our clone forever.
+    // Store a hotbar NUMBER, not an unmanaged addon pointer; the game rebuilds
+    // addon instances on teleports and HUD layout changes.
+    private int nativeHudVisibilityReferenceBar;
+
+    // -1: no suitable unmodified vanilla hotbar to observe
+    //  0: the previously visible native hotbar is now hidden/unavailable
+    //  1: the same native hotbar is visible again
+    private int ObserveVanillaHudVisibility(bool maySelectReference)
+    {
+        var previousReference = nativeHudVisibilityReferenceBar;
+        try
+        {
+            if (nativeHudVisibilityReferenceBar > 0)
+            {
+                if (locallyHiddenHotbars.Contains(nativeHudVisibilityReferenceBar) ||
+                    nativeHudVisibilityReferenceBar == config.SelectedHotbar)
+                {
+                    nativeHudVisibilityReferenceBar = 0;
+                }
+                else
+                {
+                    var reference = GetHotbarAddon(nativeHudVisibilityReferenceBar);
+                    if (reference != null && reference->AtkUnitBase.RootNode != null &&
+                        reference->AtkUnitBase.IsVisible &&
+                        reference->AtkUnitBase.RootNode->IsVisible())
+                        return 1;
+                    if (!maySelectReference) return 0; // Hidden during a transition.
+                    // HUD layouts may change or an addon may get replaced on
+                    // zone load. During ordinary play, prefer another actually
+                    // visible, unmodified reference rather than hiding forever.
+                    nativeHudVisibilityReferenceBar = 0;
+                }
+            }
+
+            if (!maySelectReference) return -1;
+            for (var bar = 1; bar <= 10; bar++)
+            {
+                if (bar == config.SelectedHotbar || locallyHiddenHotbars.Contains(bar))
+                    continue;
+                var addon = GetHotbarAddon(bar);
+                if (addon == null || addon->AtkUnitBase.RootNode == null ||
+                    !addon->AtkUnitBase.IsVisible || !addon->AtkUnitBase.RootNode->IsVisible())
+                    continue;
+                nativeHudVisibilityReferenceBar = bar;
+                return 1;
+            }
+        }
+        catch (Exception ex)
+        {
+            if (Environment.TickCount64 - lastScreenEventWarningTick > 10000)
+            {
+                lastScreenEventWarningTick = Environment.TickCount64;
+                log.Debug($"Native HUD visibility probe unavailable: {ex.GetType().Name}");
+            }
+        }
+        // If a previously observed native hotbar is now gone/hidden and no
+        // replacement is visible, keep following that hidden state.
+        if (previousReference > 0 &&
+            !locallyHiddenHotbars.Contains(previousReference) &&
+            previousReference != config.SelectedHotbar)
+        {
+            nativeHudVisibilityReferenceBar = previousReference;
+            return 0;
+        }
+        return -1; // No native reference; use event/loading conditions.
+    }
 
     private void UpdateScreenEventVisibility(bool uiReady)
     {
@@ -3108,6 +3177,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             Volatile.Write(ref hideForScreenEvent, 0);
             lastNpcDialogueVisibleTick = 0;
             lastCutsceneVisibleTick = 0;
+            nativeHudVisibilityReferenceBar = 0;
             return;
         }
         // An event may unload the local player briefly without ending the
@@ -3173,14 +3243,48 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
         else lastCutsceneVisibleTick = 0;
 
-        // Smooth addon transitions (200ms) and cutscene scene switches (500ms),
-        // but always reveal the overlay again after normal gameplay resumes.
+        // v2.0.5.7: Follow the game's HUD, not a fixed half-second timeout.
+        // GameUiHidden covers the actual UI hide control; BetweenAreas flags
+        // cover zone-change black screens that cutscene flags often miss.
+        // A known-visible, *unmodified* native action bar is an additional
+        // read-only reference for FF14's own hide/show behavior. An unobserved
+        // reference does not suppress the overlay (fallback to conditions).
+        bool gameUiHidden = false;
+        bool betweenAreas = false;
+        try
+        {
+            gameUiHidden = gameGui.GameUiHidden;
+            betweenAreas = condition[ConditionFlag.BetweenAreas] ||
+                condition[ConditionFlag.BetweenAreas51];
+        }
+        catch (Exception ex)
+        {
+            if (now - lastScreenEventWarningTick > 10000)
+            {
+                lastScreenEventWarningTick = now;
+                log.Debug($"HUD loading check unavailable: {ex.GetType().Name}");
+            }
+        }
+
+        // Learn a reference in normal play. Reuse it across the transition,
+        // resolving the addon fresh each update because it can be rebuilt.
+        var maySelectReference = !cutsceneVisible && !npcVisible &&
+            !gameUiHidden && !betweenAreas;
+        int nativeHudState = config.HideDuringCutscenes
+            ? ObserveVanillaHudVisibility(maySelectReference) : -1;
+
+        // The native bar returning is the earliest useful SHOW signal. Do not
+        // wait 500ms when its HUD is already visible. Without a usable reference,
+        // keep a tiny 80ms fallback for event-addon transitions.
         bool dialogueHold = lastNpcDialogueVisibleTick != 0 &&
             now - lastNpcDialogueVisibleTick < 200;
         bool cutsceneHold = lastCutsceneVisibleTick != 0 &&
-            now - lastCutsceneVisibleTick < 500;
+            now - lastCutsceneVisibleTick < 80;
+        bool hideForCutscene = config.HideDuringCutscenes &&
+            (betweenAreas || nativeHudState == 0 ||
+             (nativeHudState != 1 && (cutsceneVisible || cutsceneHold)));
         Volatile.Write(ref hideForScreenEvent,
-            npcVisible || dialogueHold || cutsceneVisible || cutsceneHold ? 1 : 0);
+            gameUiHidden || npcVisible || dialogueHold || hideForCutscene ? 1 : 0);
     }
 
     // ---- alpha41: in-process Dalamud/ImGui renderer ----
