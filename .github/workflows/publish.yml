@@ -1,0 +1,117 @@
+name: Publish WrathPrivateHotbar to Dalamud
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Fetch Dalamud dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://goatcorp.github.io/dalamud-distrib/latest.zip'
+          $destination = Join-Path $env:APPDATA 'XIVLauncher\addon\Hooks\dev'
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile 'dalamud-latest.zip'
+          Expand-Archive -Path 'dalamud-latest.zip' -DestinationPath $destination -Force
+
+      - name: Build plugin
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet build 'Plugin/WrathPrivateHotbar.csproj' -c Release -p:Platform=x64 --nologo
+          if ($LASTEXITCODE -ne 0) { throw "dotnet build failed: $LASTEXITCODE" }
+
+      - name: Package and prepare Dalamud repository metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifestPath = 'Plugin/WrathPrivateHotbar.json'
+          $manifest = Get-Content $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+          $version = [string]$manifest.AssemblyVersion
+          if ($version -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw "Unexpected AssemblyVersion: $version" }
+          $tag = "v$version"
+          $repo = $env:GITHUB_REPOSITORY
+          $download = "https://github.com/$repo/releases/download/$tag/latest.zip"
+
+          $dll = 'Plugin/bin/x64/Release/WrathPrivateHotbar.dll'
+          if (!(Test-Path $dll)) { throw "Built DLL missing: $dll" }
+          $target = 'dist/WrathPrivateHotbar'
+          New-Item -ItemType Directory -Path $target -Force | Out-Null
+          Copy-Item $dll (Join-Path $target 'WrathPrivateHotbar.dll')
+          Copy-Item $manifestPath (Join-Path $target 'WrathPrivateHotbar.json')
+          $pdb = 'Plugin/bin/x64/Release/WrathPrivateHotbar.pdb'
+          if (Test-Path $pdb) { Copy-Item $pdb (Join-Path $target 'WrathPrivateHotbar.pdb') }
+          Compress-Archive -Path $target -DestinationPath 'dist/latest.zip' -Force
+
+          $entry = [ordered]@{
+            Author = [string]$manifest.Author
+            Name = [string]$manifest.Name
+            InternalName = [string]$manifest.InternalName
+            Punchline = [string]$manifest.Punchline
+            Description = [string]$manifest.Description
+            Changelog = [string]$manifest.Changelog
+            AssemblyVersion = $version
+            ApplicableVersion = [string]$manifest.ApplicableVersion
+            DalamudApiLevel = [int]$manifest.DalamudApiLevel
+            RepoUrl = "https://github.com/$repo"
+            IsHide = $false
+            IsTestingExclusive = $false
+            DownloadLinkInstall = $download
+            DownloadLinkUpdate = $download
+            DownloadLinkTesting = $download
+            LastUpdate = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          }
+          $json = ConvertTo-Json -InputObject @($entry) -Depth 8
+          Set-Content -Path 'pluginmaster.json' -Value $json -Encoding utf8
+          Write-Host "Version: $version; release tag: $tag"
+          Write-Host "Dalamud URL: https://raw.githubusercontent.com/$repo/main/pluginmaster.json"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Create versioned GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ steps.meta.outputs.tag }}'
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $tag already exists. Increase the plugin version for the next release."
+          }
+          gh release create $tag 'dist/latest.zip' --repo $env:GITHUB_REPOSITORY --target main --title "WrathPrivateHotbar $tag" --notes "WrathPrivateHotbar $tag : Dalamud custom repository release. Please test in-game before sharing." --latest
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release creation failed' }
+
+      - name: Publish pluginmaster.json to main
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add pluginmaster.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host 'pluginmaster.json is unchanged.'
+          } else {
+            git commit -m "Publish WrathPrivateHotbar ${{ steps.meta.outputs.tag }}"
+            if ($LASTEXITCODE -ne 0) { throw 'Git commit failed' }
+            git push origin HEAD:main
+            if ($LASTEXITCODE -ne 0) { throw 'Git push failed. Check Actions workflow permissions and branch protection.' }
+          }
