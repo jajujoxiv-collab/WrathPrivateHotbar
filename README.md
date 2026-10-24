@@ -34,7 +34,7 @@
 2. **試験的機能（Experimental）→ カスタムプラグインリポジトリ** に以下のURLを追加し、有効にする。
 
    ```text
-   [https://raw.githubusercontent.com/jajujoxiv/WrathPrivateHotbar/main/pluginmaster.json](https://raw.githubusercontent.com/jajujoxiv/WrathPrivateHotbar/main/pluginmaster.json)
+   https://raw.githubusercontent.com/jajujoxiv/WrathPrivateHotbar/main/pluginmaster.json
    ```
 
 3. プラグインインストーラー `/xlplugins` を開き、**WrathPrivateHotbar** を検索してインストール。
