@@ -1,10 +1,10 @@
 [
   {
-  "Author": "WrathPrivateHotbar",
-  "Name": "WrathPrivateHotbar",
-  "InternalName": "WrathPrivateHotbar",
-  "Punchline": "WrathComboのスキル置き換えを指定したホットバーだけに制限し、疑似ホットバーで操作できます。",
-  "Description": "WrathPrivateHotbarは、WrathComboによるスキルの自動置き換えを特定のホットバーに限定し、ほかのホットバーは純正の表示・操作を維持します。\n\n疑似ホットバーはリキャスト表示、長押し連打、純正効果音と発光の同期に対応しています。\n\n※キーボード・マウス専用（ゲームパッド非対応）。\n\n※配信・画面共有で疑似ホットバーを非表示にするには、別途キャプチャ除外に対応した環境が必要です。",
+    "Author": "WrathPrivateHotbar",
+    "Name": "WrathPrivateHotbar",
+    "InternalName": "WrathPrivateHotbar",
+    "Punchline": "WrathComboのスキル置き換えを指定したホットバーだけに制限し、疑似ホットバーで操作できます。",
+    "Description": "WrathPrivateHotbarは、WrathComboによるスキルの自動置き換えを特定のホットバーに限定し、ほかのホットバーは純正の表示・操作を維持します。\n\n疑似ホットバーはリキャスト表示、長押し連打、純正効果音と発光の同期に対応しています。\n\n※キーボード・マウス専用（ゲームパッド非対応）。\n\n※配信・画面共有で疑似ホットバーを非表示にするには、別途キャプチャ除外に対応した環境が必要です。",
     "Changelog": "疑似ホットバーの押下アニメーション（縮小→戻り・短い白フラッシュ）、リキャスト縁進行表示、純正描画フックからのProc強調（取得時のみ）、任意ONの扇形リキャストを追加。v2.0.5.3のReAction音同期・内蔵Turboは維持。実機テスト待ち。",
     "AssemblyVersion": "2.0.5.4",
     "ApplicableVersion": "any",
@@ -15,6 +15,6 @@
     "DownloadLinkInstall": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.4/latest.zip",
     "DownloadLinkUpdate": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.4/latest.zip",
     "DownloadLinkTesting": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.4/latest.zip",
-    "LastUpdate": 1792842487
+    "LastUpdate": 1792843702
   }
 ]
