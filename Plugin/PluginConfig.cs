@@ -7,8 +7,10 @@ public sealed class PluginConfig : IPluginConfiguration
     public int Version { get; set; } = 16;
     // Dalamud game UI only. The old external renderer is not distributed.
     public bool InternalHotbarEnabled { get; set; } = true;
-    // Hide our UI only while NPC dialogue/choice addons are visible.
+    // NPC dialogue and cutscene visibility are independently configurable.
     public bool HideDuringNpcDialogue { get; set; } = true;
+    // Hide our pseudo-hotbar in cinematic, movie and quest/event playback.
+    public bool HideDuringCutscenes { get; set; } = true;
     public bool InternalHotbarLocked { get; set; } = false;
     public int InternalHotbarCellSize { get; set; } = 56;
     // Slot spacing is adjustable independently of size.
@@ -56,9 +58,7 @@ public sealed class PluginConfig : IPluginConfiguration
     public bool OverlayUseAdjustedIds { get; set; } = true;
     public bool OverlayEnabled { get; set; } = false;
     public bool PulseEnabled { get; set; } = true;
-    // Sound-ID discovery only. Both are opt-in, no audio suppression is performed.
-    public int SoundProbeId { get; set; } = 12;
-    public bool SoundProbeOnPulse { get; set; } = false;
+    // The shipped native UI input sound uses ID 12; no sound ID probe UI.
     // Opt-in only: FF14 native SFX gate while an unmodified assigned key is held.
     // Do not enable by default because SE call paths can change with patches.
     public bool SoundSyncNativeOnPulse { get; set; } = false;

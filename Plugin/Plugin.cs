@@ -499,7 +499,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             var now = Environment.TickCount64;
             if (!hudReady || !(config.OverlayEnabled || config.InternalHotbarEnabled) || !config.OverlayClickActions ||
                 !clientState.IsLoggedIn || !IsGameForeground() ||
-                Volatile.Read(ref hideForNpcDialogue) != 0 ||
+                Volatile.Read(ref hideForScreenEvent) != 0 ||
                 requestedBar != config.SelectedHotbar ||
                 slotIndex < 0 || slotIndex >= 12 ||
                 age < 0 || age > TimeSpan.FromSeconds(1).Ticks ||
@@ -1103,18 +1103,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private long lastPulseKeyPressAt;
     private int pulseCount;
     private string pulseStatus = "未実行";
-    // TEST ONLY: Play the original game UI SFX through UIGlobals.PlaySoundEffect.
-    // This does NOT suppress ReAction-generated game sounds. The target ID must
-    // first be identified in-game before any sound-specific native filtering.
-    private string soundProbeStatus = "未テスト";
-    private long soundProbeLastMs;
-
-
-    // v2.0.5.2: optional native FF14 UI-sound gate for ReAction Turbo input.
-    // NOT a replacement audio file: both detection and replay use the original
-    // UIGlobals.PlaySoundEffect path. Does not modify key events/actions.
-    // Only the selected ID is muted, and only while a corresponding unmodified
-    // key of the selected hotbar is actually held.
+    // Optional original FF14 UI-sound synchronization while holding a hotbar key.
+    // Reuses the genuine sound path (ID 12); it does not alter actual key inputs.
+    // The sound interception may need updating after FF14 patches.
     // nint is used for the ABI return as the native function is not yet verified
     // on the user's current FF14 build (void callers ignore RAX; pointer callers
     // require RAX to be preserved). Treat this as a deliberately opt-in test.
@@ -1124,10 +1115,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private bool originalUiSoundHookInstalled;
     private int audioSoundHookEnabled;
     private int audioHeldKey;
-    private int audioSoundId = 12;
+    private const uint NativeInputSoundId = 12u;
+    // Keep the intercepted-call guard: do not replay until actual input sound
+    // was observed on this client's current build.
     private int audioSeen;
-    private int audioMuted;
-    private int audioPulseReplays;
     private string audioSyncStatus = "OFF（通常のFF14サウンド）";
     [ThreadStatic] private static bool ownNativeAudioReplay;
 
@@ -1138,10 +1129,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (!ownNativeAudioReplay &&
             Volatile.Read(ref audioSoundHookEnabled) != 0 &&
             Volatile.Read(ref audioHeldKey) != 0 &&
-            id == (uint)Volatile.Read(ref audioSoundId))
+            id == NativeInputSoundId)
         {
             Interlocked.Increment(ref audioSeen);
-            Interlocked.Increment(ref audioMuted);
             // Skipping this one sound call is intentional. An ID unrelated to
             // the Turbo keypress MUST NOT be configured here.
             return 0;
@@ -1154,7 +1144,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
     // next frame if the user unchecks the option.
     private void UpdateOriginalUiSoundHook(bool uiReady)
     {
-        Volatile.Write(ref audioSoundId, Math.Clamp(config.SoundProbeId, 1, 500));
         if (!config.SoundSyncNativeOnPulse || !uiReady || !clientState.IsLoggedIn)
         {
             Volatile.Write(ref audioSoundHookEnabled, 0);
@@ -1187,7 +1176,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 originalUiSoundHookInstalled = true;
             }
             Volatile.Write(ref audioSoundHookEnabled, 1);
-            audioSyncStatus = "監視中。対応キーを長押しして遮断数を確認";
+            audioSyncStatus = "純正操作音の同期処理が有効です";
         }
         catch (Exception ex)
         {
@@ -1208,8 +1197,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         ownNativeAudioReplay = true;
         try
         {
-            UIGlobals.PlaySoundEffect((uint)Volatile.Read(ref audioSoundId));
-            Interlocked.Increment(ref audioPulseReplays);
+            UIGlobals.PlaySoundEffect(NativeInputSoundId);
         }
         catch (Exception ex)
         {
@@ -1217,29 +1205,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
             log.Debug($"Audio pulse replay unavailable: {ex.Message}");
         }
         finally { ownNativeAudioReplay = false; }
-    }
-
-    private void PlayNativeUiSoundProbe(bool triggeredByPulse = false)
-    {
-        // Deliberately skip outside the foreground game and avoid accidental spam.
-        if (!IsGameForeground()) return;
-        var now = Environment.TickCount64;
-        if (!triggeredByPulse && now - soundProbeLastMs < 150) return;
-        soundProbeLastMs = now;
-        var id = config.SoundProbeId;
-        if (id < 1 || id > 500) return;
-        try
-        {
-            ownNativeAudioReplay = true;
-            try { UIGlobals.PlaySoundEffect((uint)id); }
-            finally { ownNativeAudioReplay = false; }
-            soundProbeStatus = $"FF14 UI効果音 ID {id} 再生要求済み（聞こえ方を確認）";
-        }
-        catch (Exception ex)
-        {
-            soundProbeStatus = $"音ID {id} 失敗: {ex.GetType().Name}";
-            log.Debug($"FF14 UI sound ID probe failed: {ex.Message}");
-        }
     }
 
     private static readonly int[] DefaultKeyCodes = { 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30, 0xBD, 0xBB };
@@ -1463,7 +1428,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var uiReady = Volatile.Read(ref earlyHotbarReady) != 0;
         // UI-only: hide while NPC conversation/choices are visible.
         // Does not block underlying native hotbar or alpha26 hooks.
-        UpdateNpcDialogueVisibility(uiReady);
+        UpdateScreenEventVisibility(uiReady);
         if (hudReady) RefreshNativeInternalHotbarSize();
         ProcessOverlayClick(uiReady);
         // Native proc transitions need frame-rate updates after HUD settles.
@@ -1781,7 +1746,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
             lastPulseVisualTick = Environment.TickCount64;
             unchecked { pulseVisualCounter++; }
             if (config.SoundSyncNativeOnPulse) ReplayNativeSoundAtPulse();
-            else if (config.SoundProbeOnPulse) PlayNativeUiSoundProbe(triggeredByPulse: true);
             // The overlay snapshot is only refreshed every 250ms. During an RDM
             // melee chain it can lag one step behind the actual replacement.
             // Read the live Wrath-adjusted action at the moment of each pulse.
@@ -1849,7 +1813,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             return;
         }
         if (!clientState.IsLoggedIn || Volatile.Read(ref earlyHotbarReady) == 0 ||
-            !IsGameForeground() || Volatile.Read(ref hideForNpcDialogue) != 0 ||
+            !IsGameForeground() || Volatile.Read(ref hideForScreenEvent) != 0 ||
             (!config.BuiltInTurboOutOfCombat && !condition[ConditionFlag.InCombat]))
         {
             ResetBuiltInTurbo();
@@ -3124,58 +3088,99 @@ public sealed unsafe class Plugin : IDalamudPlugin
     }
 
 
-    // NPC dialogue controls: read-only visibility checks on Framework.Update.
-    // Never hide/change FF14 addon nodes. Only suppress OUR ImGui window.
-    // Keep native addon access off the draw callback and startup transition.
+    // NPC dialogue, cutscene, and quest/event controls: read-only checks on Framework.Update.
+    // Hide ONLY our ImGui hotbar; never mutate FF14's native HUD or event UI.
+    // Separate user toggles allow cutscenes to be hidden even when dialogue hiding is off.
     private static readonly string[] NpcDialogueAddons =
     [
         "Talk", "SelectString", "SelectIconString", "SelectYesno",
         "SelectOk", "CutSceneSelectString"
     ];
-    private int hideForNpcDialogue;
+    private int hideForScreenEvent;
     private long lastNpcDialogueVisibleTick;
-    private long lastNpcDialogueWarningTick;
+    private long lastCutsceneVisibleTick;
+    private long lastScreenEventWarningTick;
 
-    private void UpdateNpcDialogueVisibility(bool uiReady)
+    private void UpdateScreenEventVisibility(bool uiReady)
     {
-        if (!config.HideDuringNpcDialogue || !uiReady ||
-            !clientState.IsLoggedIn || !playerState.IsLoaded)
+        if (!uiReady || !clientState.IsLoggedIn)
         {
-            Volatile.Write(ref hideForNpcDialogue, 0);
+            Volatile.Write(ref hideForScreenEvent, 0);
             lastNpcDialogueVisibleTick = 0;
+            lastCutsceneVisibleTick = 0;
+            return;
+        }
+        // An event may unload the local player briefly without ending the
+        // cutscene. Do not show the pseudo-hotbar during that transition.
+        if (!playerState.IsLoaded)
+        {
+            Volatile.Write(ref hideForScreenEvent, 1);
             return;
         }
 
         var now = Environment.TickCount64;
-        bool visible = false;
-        try
+        bool npcVisible = false;
+        if (config.HideDuringNpcDialogue)
         {
-            foreach (var name in NpcDialogueAddons)
+            try
             {
-                var addon = gameGui.GetAddonByName<AtkUnitBase>(name);
-                if (addon == null || addon->RootNode == null ||
-                    !addon->RootNode->IsVisible()) continue;
-                visible = true;
-                break;
+                foreach (var name in NpcDialogueAddons)
+                {
+                    var addon = gameGui.GetAddonByName<AtkUnitBase>(name);
+                    if (addon == null || addon->RootNode == null ||
+                        !addon->RootNode->IsVisible()) continue;
+                    npcVisible = true;
+                    break;
+                }
             }
-        }
-        catch (Exception ex)
-        {
-            // Do not let a broken dialogue detection affect skill/action hooks.
-            // Keep the last known state briefly until the next successful scan.
-            if (now - lastNpcDialogueWarningTick > 10000)
+            catch (Exception ex)
             {
-                lastNpcDialogueWarningTick = now;
-                log.Debug($"NPC dialogue check unavailable: {ex.GetType().Name}");
+                if (now - lastScreenEventWarningTick > 10000)
+                {
+                    lastScreenEventWarningTick = now;
+                    log.Debug($"NPC visibility check unavailable: {ex.GetType().Name}");
+                }
             }
+            if (npcVisible) lastNpcDialogueVisibleTick = now;
         }
+        else lastNpcDialogueVisibleTick = 0;
 
-        if (visible) lastNpcDialogueVisibleTick = now;
-        // Dialog addons may briefly disappear when switching from text to a
-        // choice list. A short grace period prevents the bar flickering.
-        bool hold = lastNpcDialogueVisibleTick != 0 &&
-                    now - lastNpcDialogueVisibleTick < 200;
-        Volatile.Write(ref hideForNpcDialogue, visible || hold ? 1 : 0);
+        // The game's cutscene flags cover full-screen movies, non-dialogue
+        // event camera sequences, and transitions that have no Talk addon.
+        // Dalamud's UiBuilder.CutsceneActive alone does not include flag 58,
+        // so check both the official signal and all corresponding flags.
+        bool cutsceneVisible = false;
+        if (config.HideDuringCutscenes)
+        {
+            try
+            {
+                cutsceneVisible = pluginInterface.UiBuilder.CutsceneActive ||
+                    condition[ConditionFlag.WatchingCutscene] ||
+                    condition[ConditionFlag.WatchingCutscene78] ||
+                    condition[ConditionFlag.OccupiedInCutSceneEvent] ||
+                    condition[ConditionFlag.OccupiedInEvent] ||
+                    condition[ConditionFlag.OccupiedInQuestEvent];
+            }
+            catch (Exception ex)
+            {
+                if (now - lastScreenEventWarningTick > 10000)
+                {
+                    lastScreenEventWarningTick = now;
+                    log.Debug($"Cutscene/event visibility check unavailable: {ex.GetType().Name}");
+                }
+            }
+            if (cutsceneVisible) lastCutsceneVisibleTick = now;
+        }
+        else lastCutsceneVisibleTick = 0;
+
+        // Smooth addon transitions (200ms) and cutscene scene switches (500ms),
+        // but always reveal the overlay again after normal gameplay resumes.
+        bool dialogueHold = lastNpcDialogueVisibleTick != 0 &&
+            now - lastNpcDialogueVisibleTick < 200;
+        bool cutsceneHold = lastCutsceneVisibleTick != 0 &&
+            now - lastCutsceneVisibleTick < 500;
+        Volatile.Write(ref hideForScreenEvent,
+            npcVisible || dialogueHold || cutsceneVisible || cutsceneHold ? 1 : 0);
     }
 
     // ---- alpha41: in-process Dalamud/ImGui renderer ----
@@ -3195,7 +3200,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         if (index is < 0 or >= 12 || !config.InternalHotbarEnabled ||
             !config.OverlayClickActions || !IsGameForeground() ||
-            Volatile.Read(ref hideForNpcDialogue) != 0) return;
+            Volatile.Read(ref hideForScreenEvent) != 0) return;
         internalClickPressTicks[index] = Environment.TickCount64;
         // Write data first, commit sequence last. Consume in OnUpdate, not in Draw.
         var current = clickView.ReadInt32(4);
@@ -3210,7 +3215,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         if (!config.InternalHotbarEnabled || !clientState.IsLoggedIn ||
             Volatile.Read(ref earlyHotbarReady) == 0 || !IsGameForeground() ||
-            Volatile.Read(ref hideForNpcDialogue) != 0)
+            Volatile.Read(ref hideForScreenEvent) != 0)
             return;
         try
         {
@@ -3842,6 +3847,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
             Save();
         }
         ImGui.TextDisabled("会話・選択肢・確認画面が開いている間は自動で隠れ、終了後に戻ります。");
+        bool hideCutscenes = config.HideDuringCutscenes;
+        if (ImGui.Checkbox("カットシーン・ムービー・イベント中は疑似ホットバーを隠す", ref hideCutscenes))
+        {
+            config.HideDuringCutscenes = hideCutscenes;
+            Save();
+        }
+        ImGui.TextDisabled("イベント演出中も自動で隠れ、通常操作に戻ると再表示します。");
 
         ImGui.Separator();
         ImGui.Text("リキャスト表示");
@@ -4001,46 +4013,20 @@ public sealed unsafe class Plugin : IDalamudPlugin
             }
         }
 
-        if (ImGui.CollapsingHeader("純正ゲーム音と発光の同期（音ID12）"))
+        if (ImGui.CollapsingHeader("純正操作音と発光の同期"))
         {
-            ImGui.TextWrapped("ReActionの連打キー入力は変更しません。FF14純正の音IDを押下中だけ遮断し、発光の瞬間に同じゲーム音を再生します。初期状態はOFFです。");
+            ImGui.TextWrapped("長押し連打中のFF14純正入力音（ID12）を抑え、疑似ホットバーの発光に合わせて同じゲーム音を再生します。入力や実際のアクションは変更しません。");
             var sync = config.SoundSyncNativeOnPulse;
-            if (ImGui.Checkbox("純正入力音を発光に合わせる【検証機能・自己責任】", ref sync))
+            if (ImGui.Checkbox("純正操作音を発光と同期する", ref sync))
             {
                 config.SoundSyncNativeOnPulse = sync;
-                if (sync) config.SoundProbeOnPulse = false; // no double-play from old probe
                 if (!sync) Volatile.Write(ref audioHeldKey, 0);
                 Save();
             }
-            ImGui.TextWrapped("重要：音ID『12』が本当にReActionの入力音か、まず下の遮断数を確認してください。0のままならこの経路では音を捕まえられていません。音が二重になる場合はOFFへ戻してください。");
-            ImGui.TextDisabled(audioSyncStatus);
-            ImGui.Text($"対象音ID: {config.SoundProbeId} / 検出: {Volatile.Read(ref audioSeen)} 回 / 遮断: {Volatile.Read(ref audioMuted)} 回 / 発光時の純正音: {Volatile.Read(ref audioPulseReplays)} 回");
-            if (ImGui.Button("音の検出カウンターをリセット"))
-            {
-                Interlocked.Exchange(ref audioSeen, 0);
-                Interlocked.Exchange(ref audioMuted, 0);
-                Interlocked.Exchange(ref audioPulseReplays, 0);
-            }
-            ImGui.Separator();
-            ImGui.TextWrapped("音IDの確認・試聴（FF14本来の音源のみ）");
-            var id = config.SoundProbeId;
-            if (ImGui.SliderInt("FF14 UI効果音ID", ref id, 1, 500))
-            {
-                config.SoundProbeId = id;
-                Save();
-            }
-            if (ImGui.Button("このIDのゲーム音を1回鳴らす")) PlayNativeUiSoundProbe();
-            ImGui.SameLine();
-            ImGui.TextDisabled("1～500。無音のIDもあります");
-            var onPulse = config.SoundProbeOnPulse;
-            if (ImGui.Checkbox("旧検証：発光に合わせて音を追加（抑制なし）", ref onPulse))
-            {
-                config.SoundProbeOnPulse = onPulse;
-                if (onPulse) config.SoundSyncNativeOnPulse = false;
-                Save();
-            }
-            ImGui.TextWrapped("旧検証ONは元の連打音を止めません。v2.0.5.2の同期機能とは同時に使えません。");
-            ImGui.TextDisabled(soundProbeStatus);
+            ImGui.TextDisabled("FF14の更新後などに音が二重に聞こえる場合はOFFにしてください。");
+            if (sync && audioSyncStatus != "純正操作音の同期処理が有効です" &&
+                audioSyncStatus != "OFF（通常のFF14サウンド）")
+                ImGui.TextWrapped(audioSyncStatus);
         }
 
         if (ImGui.CollapsingHeader("起動に問題がある場合"))

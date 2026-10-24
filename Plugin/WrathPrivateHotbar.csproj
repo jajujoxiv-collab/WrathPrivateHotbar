@@ -1,10 +1,10 @@
-﻿<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
     <TargetFramework>net10.0-windows</TargetFramework>
-    <Version>2.0.5.4</Version>
+    <Version>2.0.5.6</Version>
     <Platforms>x64</Platforms>
-    <AssemblyVersion>2.0.5.4</AssemblyVersion>
-    <FileVersion>2.0.5.4</FileVersion>
+    <AssemblyVersion>2.0.5.6</AssemblyVersion>
+    <FileVersion>2.0.5.6</FileVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
