@@ -58,7 +58,19 @@ jobs:
           Copy-Item $manifestPath (Join-Path $target 'WrathPrivateHotbar.json')
           $pdb = 'Plugin/bin/x64/Release/WrathPrivateHotbar.pdb'
           if (Test-Path $pdb) { Copy-Item $pdb (Join-Path $target 'WrathPrivateHotbar.pdb') }
-          Compress-Archive -Path $target -DestinationPath 'dist/latest.zip' -Force
+          # Dalamud expects DLL and manifest at the root of latest.zip.
+          # Packaging the enclosing directory adds an extra folder and breaks installation.
+          Compress-Archive -Path (Join-Path $target '*') -DestinationPath 'dist/latest.zip' -Force
+          $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path 'dist/latest.zip').Path)
+          try {
+            $entries = @($archive.Entries | ForEach-Object { $_.FullName })
+            foreach ($required in @('WrathPrivateHotbar.dll', 'WrathPrivateHotbar.json')) {
+              if ($entries -notcontains $required) { throw "Missing ZIP root entry: $required. Actual: $($entries -join ', ')" }
+            }
+            Write-Host "Validated ZIP root entries: $($entries -join ', ')"
+          } finally {
+            $archive.Dispose()
+          }
 
           $entry = [ordered]@{
             Author = [string]$manifest.Author
@@ -78,6 +90,14 @@ jobs:
             DownloadLinkTesting = $download
             LastUpdate = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
           }
+          # On an in-place package repair, keep any edited public description.
+          if (Test-Path 'pluginmaster.json') {
+            $previousEntries = @(Get-Content 'pluginmaster.json' -Raw -Encoding UTF8 | ConvertFrom-Json)
+            if ($previousEntries.Count -gt 0 -and [string]$previousEntries[0].AssemblyVersion -eq $version) {
+              if ($previousEntries[0].Punchline) { $entry.Punchline = [string]$previousEntries[0].Punchline }
+              if ($previousEntries[0].Description) { $entry.Description = [string]$previousEntries[0].Description }
+            }
+          }
           $json = ConvertTo-Json -InputObject @($entry) -Depth 8
           Set-Content -Path 'pluginmaster.json' -Value $json -Encoding utf8
           Write-Host "Version: $version; release tag: $tag"
@@ -85,19 +105,26 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=$tag" >> $env:GITHUB_OUTPUT
 
-      - name: Create versioned GitHub release
+      - name: Publish or repair GitHub release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = '${{ steps.meta.outputs.tag }}'
-          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
-          if ($LASTEXITCODE -eq 0) {
-            throw "Release $tag already exists. Increase the plugin version for the next release."
+          $repo = $env:GITHUB_REPOSITORY
+          # gh release view returns an error when this is a brand-new version; that is expected.
+          $existing = gh release list --repo $repo --limit 100 --json tagName | ConvertFrom-Json
+          if (@($existing | Where-Object { $_.tagName -eq $tag }).Count -gt 0) {
+            # Re-upload the corrected latest.zip to the SAME release tag, no version bump required.
+            gh release upload $tag 'dist/latest.zip' --repo $repo --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Could not replace existing release asset' }
+            Write-Host "Repaired release $tag: replaced latest.zip"
+          } else {
+            gh release create $tag 'dist/latest.zip' --repo $repo --target main --title "WrathPrivateHotbar $tag" --notes "WrathPrivateHotbar $tag : Dalamud custom repository release." --latest
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create release' }
+            Write-Host "Created release $tag"
           }
-          gh release create $tag 'dist/latest.zip' --repo $env:GITHUB_REPOSITORY --target main --title "WrathPrivateHotbar $tag" --notes "WrathPrivateHotbar $tag : Dalamud custom repository release. Please test in-game before sharing." --latest
-          if ($LASTEXITCODE -ne 0) { throw 'GitHub release creation failed' }
 
       - name: Publish pluginmaster.json to main
         shell: pwsh
