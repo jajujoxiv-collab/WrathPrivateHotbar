@@ -34,7 +34,7 @@
 2. **試験的機能（Experimental）→ カスタムプラグインリポジトリ** に以下のURLを追加し、有効にする。
 
    ```text
-   https://raw.githubusercontent.com/jajujoxiv-collab/WrathPrivateHotbar/main/pluginmaster.json
+   [https://raw.githubusercontent.com/jajujoxiv/WrathPrivateHotbar/main/pluginmaster.json](https://raw.githubusercontent.com/jajujoxiv/WrathPrivateHotbar/main/pluginmaster.json)
    ```
 
 3. プラグインインストーラー `/xlplugins` を開き、**WrathPrivateHotbar** を検索してインストール。
@@ -56,5 +56,3 @@ GitHub Releasesから開発・配布ファイルを確認する場合は、[Rele
 - ソースコード：`Plugin/`
 - GitHub Actions：`.github/workflows/build.yml`（ビルド）と `.github/workflows/publish.yml`（配布）
 - 配布情報：`pluginmaster.json`（配布用ワークフローが生成）
-
-現行公開版の状態は [Releases](https://github.com/jajujoxiv-collab/WrathPrivateHotbar/releases) を確認してください。READMEの更新はプラグインDLLの再ビルドを必要としません。
