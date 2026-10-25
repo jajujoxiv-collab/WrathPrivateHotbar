@@ -10,11 +10,12 @@
     "ApplicableVersion": "any",
     "DalamudApiLevel": 15,
     "RepoUrl": "https://github.com/jajujoxiv/WrathPrivateHotbar",
+    "IconUrl": "https://raw.githubusercontent.com/jajujoxiv/WrathPrivateHotbar/main/icon.png",
     "IsHide": false,
     "IsTestingExclusive": false,
     "DownloadLinkInstall": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.9/latest.zip",
     "DownloadLinkUpdate": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.9/latest.zip",
     "DownloadLinkTesting": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.9/latest.zip",
-    "LastUpdate": 1792932296
+    "LastUpdate": 1792933250
   }
 ]
