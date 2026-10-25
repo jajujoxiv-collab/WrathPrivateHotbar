@@ -2,6 +2,7 @@
   "Author": "WrathPrivateHotbar",
   "Name": "WrathPrivateHotbar",
   "InternalName": "WrathPrivateHotbar",
+  "IconUrl": "https://raw.githubusercontent.com/jajujoxiv/WrathPrivateHotbar/main/icon.png",
   "Punchline": "WrathCombo用ホットバーの表示を分離し、操作可能な疑似ホットバーを表示します。",
   "Description": "WrathComboのスキル置き換えを指定したホットバーに限定し、ほかのホットバーの標準表示・実行を維持します。\n\n疑似ホットバーはリキャスト・チャージ・消費MPなどのリソースコスト表示、長押し連打、純正効果音と発光の同期に対応。NPC会話・カットシーン・ムービー・イベント中は自動で非表示にできます。\n\n※キーボード・マウス専用（ゲームパッド非対応）。\n※配信・画面共有で疑似ホットバーを隠す場合、別途キャプチャ除外に対応した環境が必要です。",
   "Tags": [
@@ -9,8 +10,8 @@
     "WrathCombo",
     "Japanese"
   ],
-  "AssemblyVersion": "2.0.5.9",
+  "AssemblyVersion": "2.0.5.10",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,
-  "Changelog": "手動のキー連打、疑似ホットバー発光、内蔵Turbo実行要求の各間隔を直近・平均・最短・最長で確認できる計測欄を追加。/wprivateのヘルプは動作確認済みのconfigのみ表示。HUD同期や既存の操作処理は維持。"
+  "Changelog": "インストール済みプラグイン画面でもアイコンを表示できるよう、プラグイン本体のマニフェストにIconUrlを追加。ゲーム内の動作とHUD同期、連打間隔計測は変更なし。"
 }
