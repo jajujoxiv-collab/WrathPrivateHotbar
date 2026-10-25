@@ -4,17 +4,17 @@
     "Name": "WrathPrivateHotbar",
     "InternalName": "WrathPrivateHotbar",
     "Punchline": "WrathCombo用ホットバーの表示を分離し、操作可能な疑似ホットバーを表示します。",
-    "Description": "WrathComboのスキル置き換えを指定したホットバーに限定し、ほかのホットバーの標準表示・実行を維持します。\n\n疑似ホットバーはリキャスト・チャージ表示、長押し連打、純正効果音と発光の同期に対応。NPC会話・カットシーン・ムービー・イベント中は自動で非表示にできます。\n\n※キーボード・マウス専用（ゲームパッド非対応）。\n※配信・画面共有で疑似ホットバーを隠す場合、別途キャプチャ除外に対応した環境が必要です。",
-    "Changelog": "カットシーン・ムービー・イベント中の自動非表示に対応。暗転・エリア切替中の疑似ホットバー自動非表示と標準HUDの再表示タイミングへの追従を追加。音ID12やTurboなどの機能は維持。",
-    "AssemblyVersion": "2.0.5.7",
+    "Description": "WrathComboのスキル置き換えを指定したホットバーに限定し、ほかのホットバーの標準表示・実行を維持します。\n\n疑似ホットバーはリキャスト・チャージ・消費MPなどのリソースコスト表示、長押し連打、純正効果音と発光の同期に対応。NPC会話・カットシーン・ムービー・イベント中は自動で非表示にできます。\n\n※キーボード・マウス専用（ゲームパッド非対応）。\n※配信・画面共有で疑似ホットバーを隠す場合、別途キャプチャ除外に対応した環境が必要です。",
+    "Changelog": "同一の変化後アクションIDに一致する複数のスロットは1枠だけ発光するよう改善。純正風の入力時フラッシュを強化し、スキルのMP/CP/GP消費数値を左下に追加。v2.0.5.7のHUD同期・暗転非表示・Turbo・音ID12を維持。",
+    "AssemblyVersion": "2.0.5.8",
     "ApplicableVersion": "any",
     "DalamudApiLevel": 15,
     "RepoUrl": "https://github.com/jajujoxiv/WrathPrivateHotbar",
     "IsHide": false,
     "IsTestingExclusive": false,
-    "DownloadLinkInstall": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.7/latest.zip",
-    "DownloadLinkUpdate": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.7/latest.zip",
-    "DownloadLinkTesting": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.7/latest.zip",
-    "LastUpdate": 1792860949
+    "DownloadLinkInstall": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.8/latest.zip",
+    "DownloadLinkUpdate": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.8/latest.zip",
+    "DownloadLinkTesting": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.8/latest.zip",
+    "LastUpdate": 1792931273
   }
 ]
