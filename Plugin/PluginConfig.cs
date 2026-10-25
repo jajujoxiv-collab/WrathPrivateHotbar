@@ -28,6 +28,8 @@ public sealed class PluginConfig : IPluginConfiguration
     // The user explicitly requested bright icons in v2.0.5: optional only.
     public bool NativeCooldownSectorEnabled { get; set; } = false;
     public bool NativePressFeedbackEnabled { get; set; } = true;
+    // Show the native resource cost number (MP/CP/GP) at the icon bottom-left.
+    public bool NativeActionCostEnabled { get; set; } = true;
     public bool NativeProcHighlightEnabled { get; set; } = true;
     public bool OverlayHideShortRecast { get; set; } = true;
     public int[]? PulseKeyCodes { get; set; } = null;

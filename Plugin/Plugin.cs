@@ -1066,7 +1066,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             overlayView.Write(baseOffset + 32, fresh ? (int)Math.Clamp(currentTick - sample.Tick, 0, 1000000) : -1);
             overlayView.Write(baseOffset + 36, command);
             overlayView.Write(baseOffset + 40, fresh ? sample.CostValue : 0u);
-            overlayView.Write(baseOffset + 44, 0u); // reserved
+            overlayView.Write(baseOffset + 44, slot == null ? -1 : (int)slot->CommandType); // read-only slot kind
         }
         nativeMirrorFreshSlots = freshCount;
         nativeMirrorStatus = freshCount > 0
@@ -1984,6 +1984,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private int lastPulseTargetBar;
     private int lastPulseTargetSlot;
 
+    // v2.0.5.8: A transformed action can occupy several distinct stored
+    // slots (e.g. BLM Fire + Blizzard both display Paradox). Choose exactly
+    // ONE target for each pulse; do not make every matching icon depress.
+    // When possible prefer the original stored action, otherwise use the first
+    // valid native HUD slot. Never change any hotbar assignment or action ID.
     private int PulseOneMatchingNativeSlot(uint requested, uint sourceStored)
     {
         if (sourceStored == 0 || requested == 0) return 0;
@@ -1991,16 +1996,17 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (module == null) return 0;
 
         var sourceNative = GetNativePulseAction(sourceStored);
-        // Same action: duplicates on other bars may light up (utilities etc.).
-        // Different action: ONLY light the exact native action that Wrath is
-        // recommending. Do not also light duplicates of the source action.
-        // This handles Jolt -> Scorch/Resolution as well as enchanted melee.
         var sameAction = requested == sourceNative || requested == sourceStored;
         lastPulseRequested = requested;
         lastPulseTargetNative = 0;
         lastPulseTargetBar = 0;
         lastPulseTargetSlot = 0;
-        var count = 0;
+
+        AddonActionBarBase* chosenAddon = null;
+        int chosenIndex = -1;
+        uint chosenNative = 0;
+        int chosenBar = -1;
+        bool chosenStoredIdMatches = false;
         for (var addonIndex = 0; addonIndex < 10; addonIndex++)
         {
             var addonName = addonIndex == 0 ? "_ActionBar" : $"_ActionBar{addonIndex:00}";
@@ -2017,20 +2023,27 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 var stored = slot->CommandId;
                 if (stored == 0) continue;
                 var native = GetNativePulseAction(stored);
-                // Only identical *currently transformed* skills match. Stored
-                // IDs are allowed for identical, untransformed duplicate skills
-                // but never as an extra combo recommendation.
-                var matches = native == requested ||
+                bool matches = native == requested ||
                     (sameAction && stored == sourceStored && native == sourceNative);
                 if (!matches) continue;
-                addon->PulseActionBarSlot(i);
-                count++;
-                lastPulseTargetNative = native;
-                lastPulseTargetBar = barIndex + 1;
-                lastPulseTargetSlot = i + 1;
+
+                bool preferred = stored == sourceStored;
+                // Keep the first valid match unless we find a better match
+                // whose ORIGINAL stored action matches the pressed source.
+                if (chosenAddon != null && (!preferred || chosenStoredIdMatches)) continue;
+                chosenAddon = addon;
+                chosenIndex = i;
+                chosenNative = native;
+                chosenBar = barIndex;
+                chosenStoredIdMatches = preferred;
             }
         }
-        return count;
+        if (chosenAddon == null || chosenIndex < 0) return 0;
+        chosenAddon->PulseActionBarSlot(chosenIndex);
+        lastPulseTargetNative = chosenNative;
+        lastPulseTargetBar = chosenBar + 1;
+        lastPulseTargetSlot = chosenIndex + 1;
+        return 1;
     }
 
     // Sprint may be saved as GeneralAction 4 or Action 3 depending on the
@@ -3476,33 +3489,105 @@ public sealed unsafe class Plugin : IDalamudPlugin
     // in ImGui and never change game action execution, recast, or the native
     // game's own render nodes. Press timestamps come from already validated
     // key-pulse state and from actual mouse clicks.
+    // v2.0.5.8: More visible native-inspired input feedback. The action icon
+    // itself is never replaced or modified: an ImGui overlay recreates the
+    // vanilla quick push-in and bright white/gold press flash on that ONE slot.
+    private const long PressFeedbackDurationMs = 205;
+
     private static float NativeLikePressScale(long ageMs)
     {
-        if (ageMs < 0 || ageMs >= 170) return 1f;
-        // Initial push-in, then spring-like return to normal icon size.
-        var t = Math.Clamp(ageMs / 170f, 0f, 1f);
-        var eased = 1f - MathF.Pow(1f - t, 2.2f);
-        return 0.90f + 0.10f * eased;
+        if (ageMs < 0 || ageMs >= PressFeedbackDurationMs) return 1f;
+        var t = Math.Clamp(ageMs / (float)PressFeedbackDurationMs, 0f, 1f);
+        // First frames noticeably compress the icon; return smoothly.
+        var eased = 1f - MathF.Pow(1f - t, 2.3f);
+        return 0.89f + 0.11f * eased;
     }
 
     private static void DrawNativeLikePressFeedback(ImDrawListPtr dl,
         Vector2 min, Vector2 max, long ageMs)
     {
-        if (ageMs < 0 || ageMs >= 170) return;
-        var phase = Math.Clamp(ageMs / 170f, 0f, 1f);
-        byte whiteAlpha = (byte)Math.Clamp((int)(70f * (1f - phase)), 0, 70);
-        uint whiteOverlay = ((uint)whiteAlpha << 24) | 0x00FFFFFFu;
-        dl.AddRectFilled(min + new Vector2(2f), max - new Vector2(2f), whiteOverlay);
-        var ringAlpha = (byte)Math.Clamp((int)(245f * (1f - phase * .8f)), 0, 255);
-        uint ringColor = ((uint)ringAlpha << 24) | 0x00D6F8FFu;
-        dl.AddRect(min + new Vector2(1f), max - new Vector2(1f), ringColor, 0f, 0, 2.4f);
-        if (phase < .50f)
+        if (ageMs < 0 || ageMs >= PressFeedbackDurationMs) return;
+        var t = Math.Clamp(ageMs / (float)PressFeedbackDurationMs, 0f, 1f);
+        // Fade rapidly after an obvious initial flash; still fully gone at
+        // 205ms so no permanent colored box remains on the hotbar.
+        var peak = MathF.Pow(1f - t, 1.5f);
+        byte fillA = (byte)Math.Clamp((int)(162f * peak), 0, 255);
+        byte ringA = (byte)Math.Clamp((int)(255f * (1f - t * .75f)), 0, 255);
+        byte haloA = (byte)Math.Clamp((int)(135f * peak), 0, 255);
+        // ImGui ABGR; a nearly-white face flash with soft warm edges.
+        dl.AddRectFilled(min + new Vector2(2f), max - new Vector2(2f),
+            ((uint)fillA << 24) | 0x00F1F8FFu);
+        dl.AddRect(min + new Vector2(.5f), max - new Vector2(.5f),
+            ((uint)ringA << 24) | 0x00E2F3FFu, 0f, 0, 3.5f);
+        dl.AddRect(min - new Vector2(1.5f), max + new Vector2(1.5f),
+            ((uint)haloA << 24) | 0x00B5DFFFu, 0f, 0, 3f);
+        if (t < .40f)
         {
-            // One subtle inward edge gives the pressed-in look instead of
-            // merely changing the outer rectangular glow color.
             dl.AddLine(new Vector2(min.X + 3f, max.Y - 3f),
-                new Vector2(max.X - 3f, max.Y - 3f), 0xA0000000u, 2.2f);
+                new Vector2(max.X - 3f, max.Y - 3f),
+                0xA0000000u, 2.2f);
         }
+    }
+
+    // Display the game's MP/CP/GP style resource number at the lower left.
+    // If FF14 supplies a native render sample use its computed CostValue;
+    // when the original bar is hidden query the game's own action-cost function.
+    // Cost queries are cached per slot to avoid running native code every frame.
+    private readonly uint[] displayedCostActionIds = new uint[12];
+    private readonly int[] displayedCostValues = new int[12];
+    private readonly long[] displayedCostReadTicks = new long[12];
+
+    private int GetDisplayedResourceCost(int slotIndex, uint adjustedAction,
+        bool hasNativeState, NativeMirrorSample nativeState)
+    {
+        if (!config.NativeActionCostEnabled || adjustedAction == 0 || slotIndex is < 0 or >= 12)
+            return 0;
+        // Native CostValue is authoritative if sampled for this exact action.
+        if (hasNativeState && nativeState.ActionId == adjustedAction)
+            return nativeState.CostValue is > 0 and <= 99999 ? (int)nativeState.CostValue : 0;
+        long now = Environment.TickCount64;
+        if (displayedCostActionIds[slotIndex] == adjustedAction &&
+            now - displayedCostReadTicks[slotIndex] is >= 0 and < 220)
+            return displayedCostValues[slotIndex];
+        int cost = 0;
+        try
+        {
+            if (ActionManager.Instance() != null)
+                cost = ActionManager.GetActionCost(ActionType.Action, adjustedAction, 0, 0, 0, 0);
+        }
+        catch (Exception ex)
+        {
+            if (slotIndex == 0 && now - lastActionCostWarningTick >= 10000)
+            {
+                lastActionCostWarningTick = now;
+                log.Debug($"Action-cost display unavailable: {ex.GetType().Name}");
+            }
+        }
+        cost = cost is > 0 and <= 99999 ? cost : 0;
+        displayedCostActionIds[slotIndex] = adjustedAction;
+        displayedCostValues[slotIndex] = cost;
+        displayedCostReadTicks[slotIndex] = now;
+        return cost;
+    }
+    private long lastActionCostWarningTick;
+
+    private static void DrawNativeActionCost(ImDrawListPtr dl, Vector2 min, Vector2 max,
+        int cell, int amount)
+    {
+        if (amount <= 0) return;
+        string label = amount.ToString();
+        float fontSize = Math.Clamp(cell * .33f, 13f, 54f);
+        var bounds = MeasureOverlayText(label, fontSize);
+        float maxWidth = cell * .82f;
+        if (bounds.X > maxWidth && bounds.X > 0)
+        {
+            fontSize *= maxWidth / bounds.X;
+            bounds = MeasureOverlayText(label, fontSize);
+        }
+        var pos = new Vector2(min.X + Math.Max(1f, cell * .027f),
+            max.Y - bounds.Y - Math.Max(1f, cell * .025f));
+        DrawOutlinedText(dl, label, pos, fontSize, 0xFFF8F8F8u,
+            Math.Clamp(cell * .021f, 1f, 3f));
     }
 
     // A slim, non-obscuring progress trace. The icon stays completely bright
@@ -3708,6 +3793,18 @@ public sealed unsafe class Plugin : IDalamudPlugin
                     DrawNativeLikeCooldownProgress(dl, min, max, remaining, total);
                 if (showCooldown && config.OverlayCooldownNumbers)
                     DrawNativeCooldownText(dl, min, max, cell, remaining);
+                // Native hotbar resource costs are shown below the icon at
+                // bottom left; they are separate from item counts/charges.
+                bool actionSlot = overlayView.ReadInt32(
+                    NativeMirrorSlotBase + i * NativeMirrorSlotBytes + 44) ==
+                    (int)RaptureHotbarModule.HotbarSlotType.Action;
+                if (actionSlot && storedId != 0 && kind == 0)
+                {
+                    uint costAction = lastOverlayPublishedIds[i];
+                    int actionCost = GetDisplayedResourceCost(i, costAction, hasNativeState, nativeState);
+                    if (actionCost > 0)
+                        DrawNativeActionCost(dl, min, max, cell, actionCost);
+                }
                 var chargeCurrent = overlayView.ReadInt32(904 + i * 8);
                 var chargeMax = overlayView.ReadInt32(908 + i * 8);
                 var inventory = overlayView.ReadInt32(1024 + i * 8);
@@ -3722,7 +3819,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 // confirms it. The selected bar may be hidden; no stale glow.
                 if (config.NativeProcHighlightEnabled && nativeProcActive)
                     DrawNativeLikeProcHighlight(dl, min, max, tick);
-                if (config.NativePressFeedbackEnabled && pressAgeMs >= 0 && pressAgeMs < 170)
+                if (config.NativePressFeedbackEnabled && pressAgeMs >= 0 && pressAgeMs < PressFeedbackDurationMs)
                     DrawNativeLikePressFeedback(dl, min, max, pressAgeMs);
                 else if (held)
                     dl.AddRect(min + new Vector2(1f), max - new Vector2(1f), 0xFF00DFFFu);
@@ -4009,6 +4106,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
             Save();
         }
         ImGui.TextDisabled("純正描画情報が取得できない場合は安全な通常表示に戻ります。");
+        var actionCost = config.NativeActionCostEnabled;
+        if (ImGui.Checkbox("スキルのMP/CP/GP消費数値をアイコン左下に表示する", ref actionCost))
+        {
+            config.NativeActionCostEnabled = actionCost;
+            Save();
+        }
+        ImGui.TextDisabled("FF14の実行時消費量を参照します。変化スキルや一部の特殊コストは実機で確認してください。");
 
         ImGui.Separator();
         ImGui.Text("キー操作と発光");
