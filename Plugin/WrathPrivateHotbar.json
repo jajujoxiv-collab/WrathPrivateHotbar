@@ -9,8 +9,8 @@
     "WrathCombo",
     "Japanese"
   ],
-  "AssemblyVersion": "2.0.5.8",
+  "AssemblyVersion": "2.0.5.9",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,
-  "Changelog": "同一の変化後アクションIDに一致する複数のスロットは1枠だけ発光するよう改善。純正風の入力時フラッシュを強化し、スキルのMP/CP/GP消費数値を左下に追加。v2.0.5.7のHUD同期・暗転非表示・Turbo・音ID12を維持。"
+  "Changelog": "手動のキー連打、疑似ホットバー発光、内蔵Turbo実行要求の各間隔を直近・平均・最短・最長で確認できる計測欄を追加。/wprivateのヘルプは動作確認済みのconfigのみ表示。HUD同期や既存の操作処理は維持。"
 }

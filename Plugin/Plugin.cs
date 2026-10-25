@@ -1092,6 +1092,122 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private int iconExportFailures;
     private string iconStatus = "未取得";
     private long lastScan;
+    // v2.0.5.9: read-only cadence diagnostics. Never send extra input or
+    // modify Turbo/pulse timings. Stopwatch timestamps prevent false precision
+    // from Environment.TickCount64's clock resolution.
+    private sealed class IntervalProbe
+    {
+        private const int Capacity = 32;
+        private const double MaxContinuousGapMs = 2000.0;
+        private readonly Queue<double> samples = new();
+        private long previousStamp;
+        public int Count => samples.Count;
+        public double Latest { get; private set; }
+        public double Average => samples.Count == 0 ? 0 : samples.Average();
+        public double Minimum => samples.Count == 0 ? 0 : samples.Min();
+        public double Maximum => samples.Count == 0 ? 0 : samples.Max();
+
+        public void Observe()
+        {
+            var stamp = Stopwatch.GetTimestamp();
+            if (previousStamp != 0)
+            {
+                var delta = (stamp - previousStamp) * 1000.0 / Stopwatch.Frequency;
+                if (delta > 0 && delta <= MaxContinuousGapMs)
+                {
+                    if (samples.Count >= Capacity) samples.Dequeue();
+                    samples.Enqueue(delta);
+                    Latest = delta;
+                }
+            }
+            previousStamp = stamp;
+        }
+
+        public void RestartSequence() => previousStamp = 0;
+        public void Clear()
+        {
+            samples.Clear();
+            previousStamp = 0;
+            Latest = 0;
+        }
+    }
+
+    private readonly IntervalProbe physicalTapIntervals = new();
+    private readonly IntervalProbe visualPulseIntervals = new();
+    private readonly IntervalProbe turboRequestIntervals = new();
+    private readonly bool[] physicalMonitorWasDown = new bool[12];
+    private int physicalMonitorLastSlot = -1;
+    private int physicalMonitorLastBar = -1;
+
+    // Measures only NEW physical key-down edges, not Windows key auto-repeat.
+    // This runs even if PulseEnabled is OFF, and does not activate actions.
+    private void UpdatePhysicalTapIntervalMonitor()
+    {
+        if (!clientState.IsLoggedIn || !IsGameForeground() ||
+            Volatile.Read(ref earlyHotbarReady) == 0 ||
+            Volatile.Read(ref hideForScreenEvent) != 0)
+        {
+            Array.Clear(physicalMonitorWasDown);
+            physicalTapIntervals.RestartSequence();
+            return;
+        }
+        try
+        {
+            var stage = AtkStage.Instance();
+            if ((stage != null && stage->AtkInputManager != null &&
+                 stage->AtkInputManager->IsTextInputActive) || ImGui.GetIO().WantTextInput)
+            {
+                Array.Clear(physicalMonitorWasDown);
+                physicalTapIntervals.RestartSequence();
+                return;
+            }
+        }
+        catch
+        {
+            Array.Clear(physicalMonitorWasDown);
+            physicalTapIntervals.RestartSequence();
+            return;
+        }
+        if (config.SelectedHotbar != physicalMonitorLastBar)
+        {
+            physicalMonitorLastBar = config.SelectedHotbar;
+            physicalMonitorLastSlot = -1;
+            physicalTapIntervals.RestartSequence();
+            Array.Clear(physicalMonitorWasDown);
+        }
+        var modifierHeld = (GetAsyncKeyState(0x10) & 0x8000) != 0 ||
+                           (GetAsyncKeyState(0x11) & 0x8000) != 0 ||
+                           (GetAsyncKeyState(0x12) & 0x8000) != 0;
+        var codes = EffectiveKeyCodes;
+        for (var i = 0; i < 12; i++)
+        {
+            bool down = codes[i] != 0 && (GetAsyncKeyState(codes[i]) & 0x8000) != 0;
+            if (!modifierHeld && down && !physicalMonitorWasDown[i])
+            {
+                // A new different key starts a new series; no cross-key gap.
+                if (physicalMonitorLastSlot != i)
+                {
+                    physicalTapIntervals.RestartSequence();
+                    physicalMonitorLastSlot = i;
+                }
+                physicalTapIntervals.Observe();
+            }
+            physicalMonitorWasDown[i] = down;
+        }
+        if (modifierHeld) physicalTapIntervals.RestartSequence();
+    }
+
+    private static void DrawIntervalProbe(string name, IntervalProbe probe)
+    {
+        if (probe.Count == 0)
+        {
+            ImGui.TextDisabled($"{name}: 計測待ち（同じキーを連続で押すなど）");
+            return;
+        }
+        ImGui.Text($"{name}: 直近 {probe.Latest:F1} ms / 平均 {probe.Average:F1} ms / " +
+                   $"最短 {probe.Minimum:F1} ms / 最長 {probe.Maximum:F1} ms / 直近 {probe.Count} 区間");
+    }
+
     private long nextPulseAt;
     private readonly bool[] previousKeyDown = new bool[12];
     // Only key presses that began WITHOUT Shift/Ctrl/Alt may become plain-key
@@ -1372,7 +1488,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         config.NativeIconRestoreEnabled = false;
         commands.AddHandler("/wprivate", new CommandInfo(OnCommand)
         {
-            HelpMessage = "config: 設定を開く / unlock: 編集 / lock: 固定 / togglelock: 切替"
+            HelpMessage = "config: 設定を開く"
         });
         pluginInterface.UiBuilder.Draw += DrawSettings;
         pluginInterface.UiBuilder.Draw += DrawInternalHotbar;
@@ -1436,6 +1552,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         // Keep native RDM proc information up to date in fast UI mode too.
         if (uiReady) RefreshNativeProcStatus();
         UpdateOriginalUiSoundHook(uiReady);
+        UpdatePhysicalTapIntervalMonitor();
         UpdateNativePulses();
         UpdateBuiltInTurbo();
         PublishOverlayKeyFeedback();
@@ -1621,6 +1738,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             Volatile.Write(ref audioHeldKey, 0);
             activePulseSource = -1;
             nextPulseAt = 0;
+            visualPulseIntervals.RestartSequence();
             Array.Clear(previousKeyDown);
             Array.Clear(pulseKeyEligible);
             Array.Clear(pulseUnmodifiedPressTicks);
@@ -1633,6 +1751,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             lastPulseBar = config.SelectedHotbar;
             activePulseSource = -1;
             nextPulseAt = 0;
+            visualPulseIntervals.RestartSequence();
             Array.Clear(previousKeyDown);
             Array.Clear(pulseKeyEligible);
             Array.Clear(pulseUnmodifiedPressTicks);
@@ -1689,6 +1808,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 pulseUnmodifiedPressTicks[i] = keyTick;
                 activePulseSource = i;
                 lastPulseKeyPressAt = keyTick;
+                visualPulseIntervals.RestartSequence();
                 nextPulseAt = 0;
             }
             previousKeyDown[i] = down;
@@ -1712,6 +1832,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             {
                 activePulseSource = fallback;
                 lastPulseKeyPressAt = keyTick;
+                visualPulseIntervals.RestartSequence();
                 nextPulseAt = 0;
             }
             else if (activePulseSource < 0 || keyTick - lastPulseKeyPressAt > 340)
@@ -1744,6 +1865,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             // Record the observable pulse before matching slots. This gives the
             // player keypress feedback even when no secondary hotbar slot matches.
             lastPulseVisualTick = Environment.TickCount64;
+            visualPulseIntervals.Observe();
             unchecked { pulseVisualCounter++; }
             if (config.SoundSyncNativeOnPulse) ReplayNativeSoundAtPulse();
             // The overlay snapshot is only refreshed every 250ms. During an RDM
@@ -1774,6 +1896,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     private void ResetBuiltInTurbo()
     {
+        turboRequestIntervals.RestartSequence();
         turboActiveSlot = -1;
         Array.Clear(turboKeyWasDown);
         Array.Clear(turboNextRepeatAt);
@@ -1883,7 +2006,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
             if (!down) turboNextRepeatAt[i] = 0;
             turboKeyWasDown[i] = down;
         }
-        if (newlyDown >= 0) turboActiveSlot = newlyDown;
+        if (newlyDown >= 0)
+        {
+            if (newlyDown != turboActiveSlot) turboRequestIntervals.RestartSequence();
+            turboActiveSlot = newlyDown;
+        }
         if (turboActiveSlot is < 0 or >= 12 || !turboKeyWasDown[turboActiveSlot])
         {
             turboActiveSlot = -1;
@@ -1911,6 +2038,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 return;
             }
             module->ExecuteSlotById((uint)(config.SelectedHotbar - 1), (uint)slotIndex);
+            turboRequestIntervals.Observe();
             turboRequestCount++;
             turboStatus = $"連打実行要求：HB{config.SelectedHotbar}-{slotIndex + 1} / {interval}ms / 累計{turboRequestCount}回";
         }
@@ -4155,6 +4283,25 @@ public sealed unsafe class Plugin : IDalamudPlugin
             }
         }
         ImGui.Separator();
+        if (ImGui.CollapsingHeader("連打・発光間隔の計測（実測値）", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            ImGui.TextWrapped("設定したmsではなく、このプラグインが観測できたイベント間隔を表示します。直近最大32区間の統計です。");
+            DrawIntervalProbe("手動キー連打", physicalTapIntervals);
+            ImGui.TextDisabled($"対象: HB{config.SelectedHotbar} の割当キー。同じキーを離して再度押した時のみ計測（同じキー内で比較）。");
+            DrawIntervalProbe("疑似ホットバー発光", visualPulseIntervals);
+            ImGui.TextDisabled("発光更新の実行間隔。発光の周期であり、スキルの実行周期ではありません。");
+            DrawIntervalProbe("内蔵Turbo実行要求", turboRequestIntervals);
+            ImGui.TextDisabled("内蔵Turboの実行要求間隔。FF14のスキル成功回数・GCDとは別です。");
+            ImGui.TextWrapped("外部のReAction内部連打、キー押しっぱなしのOS自動リピート、フレーム間に完結した極短い入力は測定できません。");
+            if (ImGui.Button("連打計測をリセット"))
+            {
+                physicalTapIntervals.Clear();
+                visualPulseIntervals.Clear();
+                turboRequestIntervals.Clear();
+                physicalMonitorLastSlot = -1;
+            }
+        }
+        ImGui.Separator();
         ImGui.Text("ReActionを使わない人向け：長押し連打");
         var turbo = config.BuiltInTurboEnabled;
         if (ImGui.Checkbox("内蔵Turbo（選択ホットバーの通常スキルだけ）", ref turbo))
@@ -4254,7 +4401,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
 
         ImGui.Separator();
-        ImGui.TextDisabled("/wprivate config で設定を開く　/　/wprivate unlock でロック解除");
+        ImGui.TextDisabled("/wprivate config で設定を開く（固定・解除は設定画面や鍵アイコンから操作）");
         ImGui.TextDisabled("配信で非表示になるかは録画方式によります。Dalamud内部描画だけでは自動で隠れません。");
         ImGui.End();
     }
