@@ -83,6 +83,7 @@ jobs:
             ApplicableVersion = [string]$manifest.ApplicableVersion
             DalamudApiLevel = [int]$manifest.DalamudApiLevel
             RepoUrl = "https://github.com/$repo"
+            IconUrl = "https://raw.githubusercontent.com/$repo/main/icon.png"
             IsHide = $false
             IsTestingExclusive = $false
             DownloadLinkInstall = $download
