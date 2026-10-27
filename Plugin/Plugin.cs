@@ -20,6 +20,7 @@ using Dalamud.Game.ClientState.Objects;
 using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Textures;
+using Dalamud.Interface.Textures.TextureWraps;
 using System.Numerics;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using FFXIVClientStructs.FFXIV.Client.UI;
@@ -3559,7 +3560,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     // Read-only: requests game textures only, never executes an action or changes
     // the original HotbarSlot. False means the requested texture is still pending.
     private bool DrawItemIconWithFallback(ImDrawListPtr dl, int index,
-        uint storedId, uint publishedIcon, Vector2 min, Vector2 max)
+        uint storedId, uint publishedIcon, Vector2 min, Vector2 max, float cornerRadius)
     {
         uint sheet = itemLookupId[index] == storedId ? itemSheetIcon[index] : 0u;
         uint native = itemLookupId[index] == storedId ? itemNativeIcon[index] : 0u;
@@ -3580,7 +3581,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
                         new GameIconLookup { IconId = candidate, ItemHq = useHq });
                     if (shared.TryGetWrap(out var wrap, out _) && wrap != null)
                     {
-                        dl.AddImage(wrap.Handle, min + new Vector2(1f), max - new Vector2(1f));
+                        DrawIconWithRoundedCorners(dl, wrap,
+                            min + new Vector2(1f), max - new Vector2(1f), cornerRadius);
                         itemTextureStatus[index] = $"OK: icon={candidate} HQ={(useHq ? 1 : 0)}";
                         return true;
                     }
@@ -3600,7 +3602,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 var shared = textureProvider.GetFromGame(gamePath);
                 if (shared.TryGetWrap(out var wrap, out _) && wrap != null)
                 {
-                    dl.AddImage(wrap.Handle, min + new Vector2(1f), max - new Vector2(1f));
+                    DrawIconWithRoundedCorners(dl, wrap,
+                        min + new Vector2(1f), max - new Vector2(1f), cornerRadius);
                     itemTextureStatus[index] = $"OK direct: icon={candidate}";
                     return true;
                 }
@@ -3612,6 +3615,15 @@ public sealed unsafe class Plugin : IDalamudPlugin
         return false;
     }
 
+
+    // Always clip icons to rounded geometry; unlike rectangular scissor clips,
+    // AddImageRounded rounds the image itself and preserves icon UVs.
+    private static void DrawIconWithRoundedCorners(ImDrawListPtr dl,
+        IDalamudTextureWrap texture, Vector2 min, Vector2 max, float cornerRadius)
+    {
+        dl.AddImageRounded(texture.Handle, min, max, Vector2.Zero, Vector2.One,
+            0xFFFFFFFFu, cornerRadius);
+    }
 
     // v2.0.5.4: Native-inspired press behavior. These effects are drawn solely
     // in ImGui and never change game action execution, recast, or the native
@@ -3632,7 +3644,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     }
 
     private static void DrawNativeLikePressFeedback(ImDrawListPtr dl,
-        Vector2 min, Vector2 max, long ageMs)
+        Vector2 min, Vector2 max, long ageMs, float cornerRadius)
     {
         if (ageMs < 0 || ageMs >= PressFeedbackDurationMs) return;
         var t = Math.Clamp(ageMs / (float)PressFeedbackDurationMs, 0f, 1f);
@@ -3644,11 +3656,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
         byte haloA = (byte)Math.Clamp((int)(135f * peak), 0, 255);
         // ImGui ABGR; a nearly-white face flash with soft warm edges.
         dl.AddRectFilled(min + new Vector2(2f), max - new Vector2(2f),
-            ((uint)fillA << 24) | 0x00F1F8FFu);
+            ((uint)fillA << 24) | 0x00F1F8FFu,
+            MathF.Max(0f, cornerRadius - 2f));
         dl.AddRect(min + new Vector2(.5f), max - new Vector2(.5f),
-            ((uint)ringA << 24) | 0x00E2F3FFu, 0f, 0, 3.5f);
+            ((uint)ringA << 24) | 0x00E2F3FFu, cornerRadius, 0, 3.5f);
         dl.AddRect(min - new Vector2(1.5f), max + new Vector2(1.5f),
-            ((uint)haloA << 24) | 0x00B5DFFFu, 0f, 0, 3f);
+            ((uint)haloA << 24) | 0x00B5DFFFu,
+            cornerRadius > 0f ? cornerRadius + 1.5f : 0f, 0, 3f);
         if (t < .40f)
         {
             dl.AddLine(new Vector2(min.X + 3f, max.Y - 3f),
@@ -3815,6 +3829,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var cols = NativeColumns(config.OverlayLayout);
         var rows = 12 / cols;
         var spacing = Math.Clamp(config.InternalHotbarCellGap, 0, 20);
+        // v2.0.5.81: native-style rounded icons are the standard appearance.
+        // Preserve the tested 5px radius at 56px, scaled for icon size.
+        float cornerRadius = 5f * (cell / 56f);
         // Exactly N cells and (N-1) gaps: never add a trailing phantom gap.
         var contentSize = new Vector2(cols * cell + (cols - 1) * spacing,
             rows * cell + (rows - 1) * spacing);
@@ -3848,6 +3865,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 var baseOff = 516 + i * 12;
                 var iconId = overlayView.ReadUInt32(baseOff + 8);
                 var storedId = overlayView.ReadUInt32(baseOff);
+                // Only the source CommandId decides emptiness. Icon loading
+                // latency (iconId == 0) MUST NOT hide a populated slot.
+                // Do not draw or register a click target for an empty cell.
+                if (storedId == 0u)
+                    continue;
                 var kind = overlayView.ReadInt32(1028 + i * 8);
                 bool isItem = kind == 1;
                 uint nativeIconId = 0;
@@ -3878,13 +3900,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 var iconMin = min + new Vector2(iconInset);
                 var iconMax = max - new Vector2(iconInset);
                 // The backplate does not scale, only the pressed icon does.
-                dl.AddRectFilled(min, max, 0xA0101218u);
+                dl.AddRectFilled(min, max, 0xA0101218u, cornerRadius);
 
                 bool iconRendered = false;
                 if (isItem && storedId != 0)
                 {
                     iconRendered = DrawItemIconWithFallback(dl, i, storedId,
-                        iconId, iconMin, iconMax);
+                        iconId, iconMin, iconMax, cornerRadius);
                 }
                 else if (iconId != 0)
                 {
@@ -3894,14 +3916,17 @@ public sealed unsafe class Plugin : IDalamudPlugin
                             new GameIconLookup { IconId = iconId });
                         if (shared.TryGetWrap(out var wrap, out _) && wrap != null)
                         {
-                            dl.AddImage(wrap.Handle, iconMin + new Vector2(1f), iconMax - new Vector2(1f));
+                            DrawIconWithRoundedCorners(dl, wrap,
+                                iconMin + new Vector2(1f), iconMax - new Vector2(1f),
+                                cornerRadius);
                             iconRendered = true;
                         }
                     }
                     catch { /* draw neutral background until texture is available */ }
                 }
                 if (!iconRendered)
-                    dl.AddRectFilled(iconMin, iconMax, iconId == 0 ? 0x88303030u : 0xCC181818u);
+                    dl.AddRectFilled(iconMin, iconMax,
+                        iconId == 0 ? 0x88303030u : 0xCC181818u, cornerRadius);
 
                 // v2.0.5: Timers take priority without darkening the icon. Native item
                 // hotbars hide inventory amount DURING cooldown and display a
@@ -3948,10 +3973,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 if (config.NativeProcHighlightEnabled && nativeProcActive)
                     DrawNativeLikeProcHighlight(dl, min, max, tick);
                 if (config.NativePressFeedbackEnabled && pressAgeMs >= 0 && pressAgeMs < PressFeedbackDurationMs)
-                    DrawNativeLikePressFeedback(dl, min, max, pressAgeMs);
+                    DrawNativeLikePressFeedback(dl, min, max, pressAgeMs, cornerRadius);
                 else if (held)
-                    dl.AddRect(min + new Vector2(1f), max - new Vector2(1f), 0xFF00DFFFu);
-                dl.AddRect(min, max, 0xFFA3A3CCu);
+                    dl.AddRect(min + new Vector2(1f), max - new Vector2(1f),
+                        0xFF00DFFFu, MathF.Max(0f, cornerRadius - 1f));
+                dl.AddRect(min, max, 0xFFA3A3CCu, cornerRadius);
 
                 ImGui.SetCursorScreenPos(min);
                 ImGui.PushID(i);
