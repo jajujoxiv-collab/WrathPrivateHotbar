@@ -60,6 +60,13 @@ public sealed class PluginConfig : IPluginConfiguration
     public bool OverlayUseAdjustedIds { get; set; } = true;
     public bool OverlayEnabled { get; set; } = false;
     public bool PulseEnabled { get; set; } = true;
+    // Native FF14 hotbars to favor for simulated key/click press animations.
+    // Empty = legacy automatic matching; otherwise selected bars are preferred
+    // in ascending numeric priority, with visible unselected bars as fallback.
+    // E.g. {3,4} means HB3, then HB4, then another matching native bar.
+    // This affects VISUAL pulse targets only, never skill activation or cooldowns.
+    public int[] PulseTargetHotbars { get; set; } = [];
+
     // The shipped native UI input sound uses ID 12; no sound ID probe UI.
     // Opt-in only: FF14 native SFX gate while an unmodified assigned key is held.
     // Do not enable by default because SE call paths can change with patches.

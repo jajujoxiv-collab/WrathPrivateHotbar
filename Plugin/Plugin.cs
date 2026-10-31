@@ -25,6 +25,7 @@ using System.Numerics;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.Game;
+using FFXIVClientStructs.FFXIV.Client.System.Input;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using FFXIVClientStructs.FFXIV.Client.Enums;
@@ -1379,6 +1380,152 @@ public sealed unsafe class Plugin : IDalamudPlugin
         return null;
     }
 
+    // v2.0.5.83: Read the game's actual configured keyboard bindings, not
+    // ControlHintTextNode. Native addon text can be cleared or left unready when
+    // the source hotbar is hidden (which is WPH's normal operating mode).
+    // InputId.HOTBAR_1_1..HOTBAR_10_B are consecutive, 12 slots per bar.
+    // This is read-only: no key injection, no modifications to FF14 settings,
+    // no extra gamepad input support or changed hotbar execution behavior.
+    private string keybindReadStatus = "キー割当：未取得";
+
+    // On some JIS setups, FFXIV's keybind data reports 0x84/0x8C for
+    // the physical - / ^ keys in slots 11/12. These values overlap
+    // Windows F21/undefined respectively, so native UI text is always
+    // preferred and the aliases apply ONLY for the Japanese layout.
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetKeyboardLayout(uint threadId);
+
+    private static bool UsesJapaneseKeyboardLayout()
+    {
+        try
+        {
+            if ((GetKeyboardLayout(0).ToInt64() & 0xFFFFL) == 0x0411L)
+                return true;
+        }
+        catch { /* use culture as a last resort */ }
+        return System.Globalization.CultureInfo.CurrentCulture.TwoLetterISOLanguageName == "ja";
+    }
+
+    private static string FormatGameVirtualKey(int vk, bool japaneseKeyboard, int slotIndex)
+    {
+        // Empirically observed on JP 106/109-key FF14: do not change other
+        // slots or layouts, as 0x84 may actually be bound to the F21 key.
+        if (japaneseKeyboard && slotIndex == 10 && vk == 0x84) return "-";
+        if (japaneseKeyboard && slotIndex == 11 && vk == 0x8C) return "^";
+        if (vk >= 0x30 && vk <= 0x39) return ((char)vk).ToString();
+        if (vk >= 0x41 && vk <= 0x5A) return ((char)vk).ToString();
+        if (vk >= 0x70 && vk <= 0x87) return $"F{vk - 0x6F}";
+        if (vk >= 0x60 && vk <= 0x69) return $"Num{vk - 0x60}";
+        return vk switch
+        {
+            0x08 => "Back", 0x09 => "Tab", 0x0D => "Enter", 0x1B => "Esc",
+            0x20 => "Space", 0x21 => "PgUp", 0x22 => "PgDn",
+            0x23 => "End", 0x24 => "Home", 0x25 => "Left",
+            0x26 => "Up", 0x27 => "Right", 0x28 => "Down",
+            0x2D => "Ins", 0x2E => "Del", 0x6A => "Num*",
+            0x6B => "Num+", 0x6D => "Num-", 0x6E => "Num.",
+            0x6F => "Num/", 0xBA => ";", 0xBB => "+",
+            0xBC => ",", 0xBD => "-", 0xBE => ".", 0xBF => "/",
+            0xC0 => "`", 0xDB => "[", 0xDC => "\\", 0xDD => "]",
+            0xDE => "'", 0x05 => "Mouse4", 0x06 => "Mouse5",
+            0x01 => "Mouse1", 0x02 => "Mouse2", 0x04 => "Mouse3",
+            _ => $"VK{vk:X2}" // show the real code for unknown keys, never guess
+        };
+    }
+
+    private static string FormatGameKeybind(int vk, int modifier, bool japaneseKeyboard, int slotIndex)
+    {
+        if (vk == 0) return string.Empty;
+        var name = FormatGameVirtualKey(vk, japaneseKeyboard, slotIndex);
+        // Keep the text small enough for native hotbar slots. Always reflect
+        // the actual modifier flags, rather than the plugin's turbo bindings.
+        return (modifier & 2) != 0 ? "C+" + ((modifier & 1) != 0 ? "S+" : "") + ((modifier & 4) != 0 ? "A+" : "") + name
+             : (modifier & 1) != 0 ? "S+" + ((modifier & 4) != 0 ? "A+" : "") + name
+             : (modifier & 4) != 0 ? "A+" + name
+             : name;
+    }
+
+    private string[] ReadNativeHotbarKeybindLabels()
+    {
+        var labels = new string[12];
+        var bar = config.SelectedHotbar;
+        if (bar is < 1 or > 10)
+        {
+            keybindReadStatus = "キー割当：無効なホットバー番号";
+            return labels;
+        }
+        int configured = 0;
+        int native = 0;
+        int jpAliases = 0;
+        bool japaneseKeyboard = UsesJapaneseKeyboardLayout();
+        string sourceStatus = "";
+
+        // First read the actual hotbar bindings: this also works when the
+        // source addon is hidden (common for WrathPrivateHotbar).
+        try
+        {
+            var input = UIInputData.Instance();
+            int firstId = (int)InputId.HOTBAR_1_1 + (bar - 1) * 12;
+            if (input != null && input->Keybinds != null &&
+                input->NumKeybinds > firstId + 11 && input->NumKeybinds < 2048)
+            {
+                for (int i = 0; i < 12; i++)
+                {
+                    var binding = input->Keybinds + firstId + i;
+                    var key0 = binding->KeySettings[0];
+                    var key1 = binding->KeySettings[1];
+                    var key = key0.Key == SeVirtualKey.NO_KEY ? key1 : key0;
+                    int raw = (byte)key.Key;
+                    labels[i] = FormatGameKeybind(raw, (byte)key.KeyModifier,
+                        japaneseKeyboard, i);
+                    if (labels[i].Length != 0) configured++;
+                    if (japaneseKeyboard &&
+                        ((i == 10 && raw == 0x84) || (i == 11 && raw == 0x8C)))
+                        jpAliases++;
+                }
+                sourceStatus = $"ゲーム設定（InputId {firstId}～{firstId + 11}）";
+            }
+            else
+            {
+                sourceStatus = $"入力設定が未準備（{(input == null ? -1 : input->NumKeybinds)}）";
+            }
+        }
+        catch (Exception ex)
+        {
+            sourceStatus = $"入力設定の取得失敗: {ex.GetType().Name}";
+        }
+
+        // When the native addon has its own label, it is authoritative.
+        // Unlike the raw key code, it uses the game's language/layout and
+        // supports -/^ and other OEM keys correctly. It is okay if the
+        // addon is hidden: an empty hint simply retains our direct label.
+        try
+        {
+            var addon = GetHotbarAddon(bar);
+            if (addon != null)
+            {
+                var slots = addon->ActionBarSlotVector;
+                if (slots.First != null && slots.Count >= 12 && slots.Count <= 64)
+                {
+                    for (int i = 0; i < 12; i++)
+                    {
+                        var hint = slots[i].ControlHintTextNode;
+                        if (hint == null) continue;
+                        var value = hint->NodeText.ToString().Trim();
+                        if (value.Length == 0 || value.Length > 24 || value.Any(char.IsControl))
+                            continue;
+                        labels[i] = value;
+                        native++;
+                    }
+                }
+            }
+        }
+        catch { /* native addon text is optional */ }
+
+        keybindReadStatus = $"キー割当 HB{bar}: 設定 {configured}/12, 本家表示 {native}/12, JP補正候補 {jpAliases}/12（{sourceStatus}）";
+        return labels;
+    }
+
     private bool ApplyHotbarNodeVisibility(int bar, bool visible)
     {
         var addon = GetHotbarAddon(bar);
@@ -1546,6 +1693,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         // UI-only: hide while NPC conversation/choices are visible.
         // Does not block underlying native hotbar or alpha26 hooks.
         UpdateScreenEventVisibility(uiReady);
+        UpdateKeyboundMatchVisibility();
         if (hudReady) RefreshNativeInternalHotbarSize();
         ProcessOverlayClick(uiReady);
         // Native proc transitions need frame-rate updates after HUD settles.
@@ -2074,11 +2222,40 @@ public sealed unsafe class Plugin : IDalamudPlugin
     // visual pulse ONLY; it never activates the skill or edits hotbar slots.
     private int PulseMatchingOtherHotbars(RaptureHotbarModule.HotbarSlotType type, uint stored, uint adjusted)
     {
+        // Reset the diagnostic target for every pulse, including no-match.
+        lastPulseTargetNative = 0;
+        lastPulseTargetBar = 0;
+        lastPulseTargetSlot = 0;
         if (stored == 0) return 0;
         return type == RaptureHotbarModule.HotbarSlotType.Action && !IsSprintSlot(type, stored)
             ? PulseOneMatchingNativeSlot(adjusted, stored)
             : PulseOneMatchingNonActionSlot(type, stored);
     }
+
+    // Target choices contain LOGICAL hotbar numbers (1..10), not addon IDs.
+    // Without a preference, keep the established search/matching behavior.
+    private int[] ConfiguredPulseTargets => config.PulseTargetHotbars ?? Array.Empty<int>();
+
+    // A selected HB always wins. If none of the selected HBs contains this
+    // action, fall back to another visible native HB, in ascending HB order.
+    // The extra tier is deliberately AFTER every selected HB even if its
+    // numerical ID is smaller (e.g. HB3/4 first, then HB2 or HB5).
+    private static int PulseTargetRank(int[] preferredBars, int oneBasedHotbar)
+    {
+        if (preferredBars.Length == 0) return -1;
+        int index = Array.IndexOf(preferredBars, oneBasedHotbar);
+        return index >= 0 ? index : preferredBars.Length + oneBasedHotbar - 1;
+    }
+
+    // Only use visible bars as unselected fallback targets. The legacy auto
+    // behavior and explicit target bars are left unchanged.
+    private static bool CanUsePulseFallback(AddonActionBarBase* addon)
+    {
+        return addon != null && addon->AtkUnitBase.IsVisible &&
+            addon->AtkUnitBase.RootNode != null &&
+            addon->AtkUnitBase.RootNode->IsVisible();
+    }
+
 
     // Match the currently displayed native action, NOT merely the stored ID.
     // In alpha25, `stored == sourceStored` and `nativeTarget == nativeSource`
@@ -2131,10 +2308,16 @@ public sealed unsafe class Plugin : IDalamudPlugin
         lastPulseTargetBar = 0;
         lastPulseTargetSlot = 0;
 
+        // Prefer selected native bars, but gracefully fall back to another
+        // visible native bar if the used skill has no selected-bar match.
+        // Without a selection, preserve previous automatic matching logic.
+        var targetBars = ConfiguredPulseTargets;
+        var explicitlyTargeted = targetBars.Length != 0;
         AddonActionBarBase* chosenAddon = null;
         int chosenIndex = -1;
         uint chosenNative = 0;
         int chosenBar = -1;
+        int chosenRank = int.MaxValue;
         bool chosenStoredIdMatches = false;
         for (var addonIndex = 0; addonIndex < 10; addonIndex++)
         {
@@ -2143,6 +2326,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
             if (addon == null || addon->SlotCount == 0) continue;
             var barIndex = (int)addon->RaptureHotbarId;
             if (barIndex < 0 || barIndex >= 10 || barIndex == config.SelectedHotbar - 1) continue;
+            // RaptureHotbarId is the logical bar ID; addon order may differ
+            // when the HUD has custom layouts or swapped bars.
+            int targetRank = PulseTargetRank(targetBars, barIndex + 1);
+            if (explicitlyTargeted && targetRank >= targetBars.Length && !CanUsePulseFallback(addon)) continue;
             var slots = addon->ActionBarSlotVector.AsSpan();
             var limit = Math.Min((int)addon->SlotCount, slots.Length);
             for (var i = 0; i < limit; i++)
@@ -2157,13 +2344,28 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 if (!matches) continue;
 
                 bool preferred = stored == sourceStored;
-                // Keep the first valid match unless we find a better match
-                // whose ORIGINAL stored action matches the pressed source.
-                if (chosenAddon != null && (!preferred || chosenStoredIdMatches)) continue;
+                if (chosenAddon != null)
+                {
+                    if (explicitlyTargeted)
+                    {
+                        // Selected BAR priority wins over unselected fallbacks.
+                        // Within one bar, exact stored-ID still wins.
+                        if (targetRank > chosenRank ||
+                            (targetRank == chosenRank && (!preferred || chosenStoredIdMatches)))
+                            continue;
+                    }
+                    else if (!preferred || chosenStoredIdMatches)
+                    {
+                        // Legacy behavior: prefer the exact stored action
+                        // across all visible native hotbars.
+                        continue;
+                    }
+                }
                 chosenAddon = addon;
                 chosenIndex = i;
                 chosenNative = native;
                 chosenBar = barIndex;
+                chosenRank = targetRank;
                 chosenStoredIdMatches = preferred;
             }
         }
@@ -2186,6 +2388,15 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var module = RaptureHotbarModule.Instance();
         if (module == null || sourceId == 0) return 0;
         var sourceIsSprint = IsSprintSlot(sourceType, sourceId);
+        var targetBars = ConfiguredPulseTargets;
+        var explicitlyTargeted = targetBars.Length != 0;
+        // Automatic mode keeps its historical behavior (all matches for
+        // non-actions). With selected bars, pulse only ONE matching slot,
+        // favoring selected HBs before visible fallback HBs.
+        AddonActionBarBase* preferredAddon = null;
+        int preferredIndex = -1;
+        int preferredBar = -1;
+        int preferredRank = int.MaxValue;
         var count = 0;
         for (var addonIndex = 0; addonIndex < 10; addonIndex++)
         {
@@ -2194,6 +2405,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
             if (addon == null || addon->SlotCount == 0) continue;
             var barIndex = (int)addon->RaptureHotbarId;
             if (barIndex < 0 || barIndex >= 10 || barIndex == config.SelectedHotbar - 1) continue;
+            int targetRank = PulseTargetRank(targetBars, barIndex + 1);
+            if (explicitlyTargeted && targetRank >= targetBars.Length && !CanUsePulseFallback(addon)) continue;
             var slots = addon->ActionBarSlotVector.AsSpan();
             var limit = Math.Min((int)addon->SlotCount, slots.Length);
             for (var i = 0; i < limit; i++)
@@ -2203,9 +2416,29 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 var match = (slot->CommandType == sourceType && slot->CommandId == sourceId) ||
                     (sourceIsSprint && IsSprintSlot(slot->CommandType, slot->CommandId));
                 if (!match) continue;
-                addon->PulseActionBarSlot(i);
-                count++;
+                if (explicitlyTargeted)
+                {
+                    if (targetRank >= preferredRank) continue;
+                    preferredAddon = addon;
+                    preferredIndex = i;
+                    preferredBar = barIndex;
+                    preferredRank = targetRank;
+                }
+                else
+                {
+                    addon->PulseActionBarSlot(i);
+                    lastPulseTargetBar = barIndex + 1;
+                    lastPulseTargetSlot = i + 1;
+                    count++;
+                }
             }
+        }
+        if (explicitlyTargeted && preferredAddon != null && preferredIndex >= 0)
+        {
+            preferredAddon->PulseActionBarSlot(preferredIndex);
+            lastPulseTargetBar = preferredBar + 1;
+            lastPulseTargetSlot = preferredIndex + 1;
+            return 1;
         }
         return count;
     }
@@ -3184,7 +3417,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         if (Environment.TickCount64 - lastOverlayCheck < 1000) return;
         lastOverlayCheck = Environment.TickCount64;
-        if (config.InternalHotbarEnabled || !config.OverlayEnabled || !clientState.IsLoggedIn)
+        if (config.InternalHotbarEnabled || !config.OverlayEnabled || !clientState.IsLoggedIn ||
+            Volatile.Read(ref hideForKeyboundMatch) != 0)
         {
             StopOverlay();
             return;
@@ -3310,6 +3544,20 @@ public sealed unsafe class Plugin : IDalamudPlugin
             return 0;
         }
         return -1; // No native reference; use event/loading conditions.
+    }
+
+    // v2.0.5.90: Built-in, unconditional visual-only auto-hide during the
+    // Keybound Brawler match. Territory 1359 was identified in-game by the user.
+    // The ordinary Gold Saucer uses a different ID. Do not change native HUD,
+    // WrathCombo, action execution, or keyboard bindings.
+    private const uint KnownKeyboundBrawlerMatchTerritory = 1359;
+    private int hideForKeyboundMatch;
+
+    private void UpdateKeyboundMatchVisibility()
+    {
+        bool inMatch = clientState.IsLoggedIn &&
+                       clientState.TerritoryType == KnownKeyboundBrawlerMatchTerritory;
+        Volatile.Write(ref hideForKeyboundMatch, inMatch ? 1 : 0);
     }
 
     private void UpdateScreenEventVisibility(bool uiReady)
@@ -3446,7 +3694,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         if (index is < 0 or >= 12 || !config.InternalHotbarEnabled ||
             !config.OverlayClickActions || !IsGameForeground() ||
-            Volatile.Read(ref hideForScreenEvent) != 0) return;
+            (Volatile.Read(ref hideForScreenEvent) != 0 ||
+             Volatile.Read(ref hideForKeyboundMatch) != 0)) return;
         internalClickPressTicks[index] = Environment.TickCount64;
         // Write data first, commit sequence last. Consume in OnUpdate, not in Draw.
         var current = clickView.ReadInt32(4);
@@ -3461,7 +3710,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         if (!config.InternalHotbarEnabled || !clientState.IsLoggedIn ||
             Volatile.Read(ref earlyHotbarReady) == 0 || !IsGameForeground() ||
-            Volatile.Read(ref hideForScreenEvent) != 0)
+            (Volatile.Read(ref hideForScreenEvent) != 0 ||
+             Volatile.Read(ref hideForKeyboundMatch) != 0))
             return;
         try
         {
@@ -3517,6 +3767,29 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private static Vector2 MeasureOverlayText(string value, float fontSize)
     {
         return ImGui.CalcTextSize(value) * (fontSize / Math.Max(1f, ImGui.GetFontSize()));
+    }
+
+    // Match native FF14's keybind labels. Their upper parts sit OUTSIDE the
+    // icon, not at the icon's inner top-left as in v2.0.5.83. ImGui windows
+    // clip their own draw list: temporarily expand ONLY the text clip, leaving
+    // hitboxes, icon positions, locked layout and drag geometry unchanged.
+    private static void DrawNativeKeybindLabel(ImDrawListPtr dl,
+        Vector2 min, int cell, string label)
+    {
+        if (string.IsNullOrWhiteSpace(label)) return;
+        // v2.0.5.83 was .31 => visibly too small versus the game's HUD.
+        float fontSize = Math.Clamp(cell * .46f, 15f, 46f);
+        var measured = MeasureOverlayText(label, fontSize);
+        float allowedWidth = cell * 1.12f;
+        if (measured.X > allowedWidth && measured.X > 0f)
+            fontSize = Math.Max(11f, fontSize * allowedWidth / measured.X);
+        var pos = min + new Vector2(-cell * .025f, -cell * .22f);
+        float stroke = Math.Clamp(cell * .034f, 1.2f, 3.6f);
+        float overscan = MathF.Max(16f, fontSize + stroke * 2f);
+        dl.PushClipRect(min - new Vector2(overscan),
+            min + new Vector2(cell + overscan), false);
+        DrawOutlinedText(dl, label, pos, fontSize, 0xFFF5F5F1u, stroke);
+        dl.PopClipRect();
     }
 
     private static void DrawNativeHotbarCounter(ImDrawListPtr dl, Vector2 slotMax,
@@ -3829,6 +4102,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var cols = NativeColumns(config.OverlayLayout);
         var rows = 12 / cols;
         var spacing = Math.Clamp(config.InternalHotbarCellGap, 0, 20);
+        // Snapshot the game's current keybind text once per UI draw.
+        var nativeKeybindLabels = ReadNativeHotbarKeybindLabels();
         // v2.0.5.81: native-style rounded icons are the standard appearance.
         // Preserve the tested 5px radius at 56px, scaled for icon size.
         float cornerRadius = 5f * (cell / 56f);
@@ -3978,6 +4253,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
                     dl.AddRect(min + new Vector2(1f), max - new Vector2(1f),
                         0xFF00DFFFu, MathF.Max(0f, cornerRadius - 1f));
                 dl.AddRect(min, max, 0xFFA3A3CCu, cornerRadius);
+
+                // Match the original FF14 hotbar's primary keybind hint.
+                // Only occupied slots reach this point, so hiding empty
+                // slots does not leave orphaned labels behind.
+                DrawNativeKeybindLabel(dl, min, cell, nativeKeybindLabels[i]);
 
                 ImGui.SetCursorScreenPos(min);
                 ImGui.PushID(i);
@@ -4139,6 +4419,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 if (ImGui.Selectable($"ホットバー {i}", i == bar))
                 {
                     config.SelectedHotbar = i;
+                    // The action-source bar must never be a native pulse target.
+                    config.PulseTargetHotbars = (config.PulseTargetHotbars ?? [])
+                        .Where(x => x != i).ToArray();
+                    lastPulseTargetBar = 0;
+                    lastPulseTargetSlot = 0;
                     Save();
                 }
             }
@@ -4148,6 +4433,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
         ImGui.Separator();
         ImGui.Text("疑似ホットバー");
+        ImGui.TextDisabled(keybindReadStatus);
         bool show = config.InternalHotbarEnabled;
         if (ImGui.Checkbox("疑似ホットバーを表示する", ref show))
         {
@@ -4209,6 +4495,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
             Save();
         }
         ImGui.TextDisabled("イベント演出中も自動で隠れ、通常操作に戻ると再表示します。");
+
+        // Keybound Brawler match-only auto-hide is always active (Territory 1359).
+        // No settings or manual territory registration are needed.
 
         ImGui.Separator();
         ImGui.Text("リキャスト表示");
@@ -4276,6 +4565,49 @@ public sealed unsafe class Plugin : IDalamudPlugin
             config.PulseEnabled = pulse;
             Save();
         }
+        ImGui.Spacing();
+        ImGui.Text("押下演出を表示する標準ホットバー");
+        ImGui.TextWrapped("優先して光らせたいホットバーを選択してください（例：HB3・HB4）。"
+            + " 指定先に該当スキルがなければ、表示中のほかのホットバーから探して発光させます。");
+        var targetHotbars = ConfiguredPulseTargets;
+        for (int targetBar = 1; targetBar <= 10; targetBar++)
+        {
+            bool isCurrent = targetBar == config.SelectedHotbar;
+            bool checkedTarget = Array.IndexOf(targetHotbars, targetBar) >= 0;
+            if (isCurrent) ImGui.BeginDisabled();
+            if (ImGui.Checkbox($"HB{targetBar}##pulseTarget{targetBar}", ref checkedTarget) && !isCurrent)
+            {
+                var updateTargets = new List<int>(targetHotbars);
+                updateTargets.RemoveAll(x => x == targetBar);
+                if (checkedTarget) updateTargets.Add(targetBar);
+                // Stable priority across sessions: smaller hotbar number first.
+                updateTargets.Sort();
+                config.PulseTargetHotbars = updateTargets.ToArray();
+                targetHotbars = config.PulseTargetHotbars;
+                lastPulseTargetBar = 0;
+                lastPulseTargetSlot = 0;
+                Save();
+            }
+            if (isCurrent) ImGui.EndDisabled();
+            if (targetBar % 5 != 0) ImGui.SameLine();
+        }
+        if (ImGui.Button("表示先を自動選択に戻す##pulseTargetReset"))
+        {
+            config.PulseTargetHotbars = [];
+            lastPulseTargetBar = 0;
+            lastPulseTargetSlot = 0;
+            Save();
+        }
+        ImGui.TextDisabled(targetHotbars.Length == 0
+            ? "現在：従来の自動選択（スキルが一致する標準ホットバーから選択）"
+            : $"現在：HB{string.Join(" → HB", targetHotbars)} を優先 → 未一致ならほかの表示中HBへ");
+        string pulseTargetKind = targetHotbars.Length == 0 ? "自動" :
+            Array.IndexOf(targetHotbars, lastPulseTargetBar) >= 0 ? "指定先" : "代替先";
+        ImGui.TextDisabled(lastPulseTargetBar > 0
+            ? $"直近の疑似発光先：HB{lastPulseTargetBar} スロット{lastPulseTargetSlot}（{pulseTargetKind}）"
+            : "直近の疑似発光先：なし / 未一致");
+        ImGui.TextWrapped("注意：本機能はプラグイン側で追加する押下演出の表示先を選びます。"
+            + "FF14本体のキー操作による演出は消せません。スキル使用やリキャストの挙動は変わりません。");
         if (ImGui.CollapsingHeader("キー割り当てを変更する"))
         {
             ImGui.TextWrapped("スロットごとに発光に使用するキーを指定します。Shift/Ctrl/Altとの組み合わせは設定できません。");
