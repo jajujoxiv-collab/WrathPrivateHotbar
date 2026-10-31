@@ -5,17 +5,17 @@
     "InternalName": "WrathPrivateHotbar",
     "Punchline": "WrathCombo用ホットバーの表示を分離し、操作可能な疑似ホットバーを表示します。",
     "Description": "WrathComboのスキル置き換えを指定したホットバーに限定し、ほかのホットバーの標準表示・実行を維持します。\n\n疑似ホットバーは未登録スロットを透明化し、アイコンの角をFF14標準風に丸く表示します。リキャスト・チャージ・消費MPなどのリソースコスト表示、長押し連打、純正効果音と発光の同期に対応。NPC会話・カットシーン・ムービー・イベント中、およびキーバウンド・ブロウラーの試合中は自動で非表示になります（設定不要）。\n\n未登録スキルチェッカーはWrathCombo用HBを除外し、ほかの標準ホットバーにない使用スキルをアイコン・スキル名・ID・使用回数で確認できます。ログイン中に自動監視し、検出は候補として表示されます。\n\n※キーボード・マウス専用（ゲームパッド非対応）。\n※配信・画面共有で疑似ホットバーを隠す場合、別途キャプチャ除外に対応した環境が必要です。",
-    "Changelog": "v2.0.5.94: 設定画面を6分類に整理し、WrathCombo用HB指定と押下発光先の指定を集約。v2.0.5.91～93の新機能として、WrathCombo用HBを除いた通常ホットバーの未登録スキル候補を常時監視し、アクションアイコン・名前・ID・使用回数を一覧表示。黒魔道士パラドックスはファイア/ブリザドの置き換え元を照合。監視結果はメモリ内のみで、ゲーム再起動時に消去されます。",
-    "AssemblyVersion": "2.0.5.94",
+    "Changelog": "v2.0.5.100: 未登録スキル監視を200ms間隔に高速化。スキル実行時は最短80msで追加照合。未登録候補は連続5回以上かつ1.5秒以上未配置の場合のみ警告し、コンボ等による一瞬の誤表示を抑制。登録済み判定は即時反映。v2.0.5.99までの全ジョブの標準変化学習・ナイト/戦士判定・疑似ホットバー機能を維持。",
+    "AssemblyVersion": "2.0.5.100",
     "ApplicableVersion": "any",
     "DalamudApiLevel": 15,
     "RepoUrl": "https://github.com/jajujoxiv/WrathPrivateHotbar",
     "IconUrl": "https://raw.githubusercontent.com/jajujoxiv/WrathPrivateHotbar/main/icon.png",
     "IsHide": false,
     "IsTestingExclusive": false,
-    "DownloadLinkInstall": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.94/latest.zip",
-    "DownloadLinkUpdate": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.94/latest.zip",
-    "DownloadLinkTesting": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.94/latest.zip",
-    "LastUpdate": 1793418149
+    "DownloadLinkInstall": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.100/latest.zip",
+    "DownloadLinkUpdate": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.100/latest.zip",
+    "DownloadLinkTesting": "https://github.com/jajujoxiv/WrathPrivateHotbar/releases/download/v2.0.5.100/latest.zip",
+    "LastUpdate": 1793428147
   }
 ]
