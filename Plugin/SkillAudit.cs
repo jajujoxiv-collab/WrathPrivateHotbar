@@ -33,41 +33,51 @@ public sealed unsafe partial class Plugin
     private bool auditOnlyMissing = true;
     private readonly Dictionary<uint, (string Name, uint Icon)> auditActionDetailsCache = new();
     private long auditLastSnapshotAt;
+    private uint auditSnapshotJob;
+    // Scan often enough to catch short native combo changes, without doing
+    // 9x12 hotbar reads on every FF14 frame.
+    private const long AuditSnapshotIntervalMs = 200;
+    private const long AuditActionTriggeredScanMinMs = 80;
+    // Never show an unmatched red warning from a single stale snapshot.
+    // Successful matches are shown immediately; only missing transitions
+    // need debounce across multiple distinct, successful snapshots.
+    private const long AuditMissingConfirmationMs = 1500;
+    private const int AuditMissingConfirmationSnapshots = 5;
     private string auditStatus = "自動監視の準備待ち";
     private readonly Dictionary<(uint Job, uint Action), SkillAuditEntry> auditEntries = new();
     private readonly HashSet<uint> auditStoredActionIds = new();
+    private readonly HashSet<string> auditStoredActionNames = new(StringComparer.Ordinal);
     private readonly HashSet<uint> auditNativeActionIds = new();
+    // Learn game-native transformations of an actually installed hotbar action.
+    // Only trust the original native trampoline, never WrathCombo's adjusted
+    // output. The mapping is retained across proc / combo transitions, and
+    // scoped to job + source-slot action so it cannot match an unrelated job.
+    private readonly Dictionary<(uint Job, uint Stored), HashSet<uint>> auditObservedNativeVariants = new();
+    private const int AuditMaxNativeVariantsPerSource = 16;
+    private int auditRecordedVariantEdges;
+    private bool auditNativeObserverAvailable;
+
     private bool auditSnapshotReady;
     private int auditScannedSlots;
     private int auditCheckedBars;
     private uint auditLastJob;
     private const int AuditMaxDistinctPerJob = 300;
 
-    // FFXIV's official PvE BLM job guide: Paradox cannot be placed on a
-    // hotbar. Fire and Blizzard are the two hotbar actions that change into
-    // Paradox. Check the STORED source IDs, not only the current adjusted IDs:
-    // the Paradox state may have ended when the user opens this window.
-    // Keep the mapping job-scoped to avoid treating an unrelated action as a
-    // replacement. Extend only with verified native replacement relations.
-    private const uint AuditBlmJob = 25;
-    private const uint AuditParadox = 25797;
-    private const uint AuditFire = 141;
-    private const uint AuditBlizzard = 142;
-
-    private static bool AuditIsKnownParadox(uint job, uint action) =>
-        job == AuditBlmJob && action == AuditParadox;
-
-    private bool AuditParadoxSourceRegistered() =>
-        auditStoredActionIds.Contains(AuditFire) ||
-        auditStoredActionIds.Contains(AuditBlizzard);
-
+    // Job-specific unassignable actions and their base-slot relationships are
+    // defined separately in SkillAuditNonSlotCatalog.cs.
 
     private sealed class SkillAuditEntry
     {
         public required uint Job;
         public required uint Action;
         public int Count;
+        public long FirstAt;
         public long LastAt;
+        // Presentation-only hysteresis. Preserve action counts independently
+        // from whether a transient 'missing' state has been confirmed.
+        public int ConfirmedDisplayKind = -1;
+        public long MissingSinceAt;
+        public int ConsecutiveMissingSnapshots;
     }
 
     private byte OnAuditUseActionLocation(ActionManager* self, ActionType actionType,
@@ -95,6 +105,14 @@ public sealed unsafe partial class Plugin
     {
         Volatile.Write(ref auditMonitoring, 0);
         auditStatus = status;
+        auditSnapshotReady = false;
+        auditSnapshotJob = 0;
+        foreach (var entry in auditEntries.Values)
+        {
+            entry.ConfirmedDisplayKind = -1;
+            entry.MissingSinceAt = 0;
+            entry.ConsecutiveMissingSnapshots = 0;
+        }
         if (!auditHookEnabled) return;
         auditHookEnabled = false;
         try { auditUseActionHook?.Disable(); }
@@ -135,6 +153,12 @@ public sealed unsafe partial class Plugin
                 }
             }
         }
+        // Always refresh hotbar assignments while monitoring, not just when
+        // the settings window is opened. This is essential for transient
+        // native action upgrades/combo states to be seen in real gameplay.
+        // Regular 200ms snapshot, even while the config window is closed.
+        if (shouldMonitor) RefreshSkillAuditSnapshot();
+
         // Drain in managed framework.Update; jobs and Excel sheets are NOT read
         // from the native hook. Each job keeps independent, in-memory results.
         int handled = 0;
@@ -156,24 +180,34 @@ public sealed unsafe partial class Plugin
                     auditStatus = "上限300種類に達しました。結果をクリアしてください。";
                     continue;
                 }
-                entry = new SkillAuditEntry { Job = job, Action = actionId };
+                entry = new SkillAuditEntry
+                {
+                    Job = job, Action = actionId, FirstAt = Environment.TickCount64
+                };
                 auditEntries.Add(key, entry);
             }
             entry.Count++;
             entry.LastAt = Environment.TickCount64;
         }
+        // Catch the original native transformation close to an action event.
+        // The 80ms floor bounds the work even under repeated rapid inputs.
+        if (handled > 0 && shouldMonitor)
+            RefreshSkillAuditSnapshot(actionTriggered: true);
     }
 
     // Scan ALL 10 normal (non-cross) hotbars, regardless of HUD visibility.
     // Do NOT include the selected WrathCombo source hotbar. A skill assigned
     // only on that source is always considered a missing candidate.
-    private void RefreshSkillAuditSnapshot()
+    private void RefreshSkillAuditSnapshot(bool actionTriggered = false)
     {
         var now = Environment.TickCount64;
-        if (now - auditLastSnapshotAt < 400) return;
+        var minInterval = actionTriggered
+            ? AuditActionTriggeredScanMinMs : AuditSnapshotIntervalMs;
+        if (now - auditLastSnapshotAt < minInterval) return;
         auditLastSnapshotAt = now;
         auditSnapshotReady = false;
         auditStoredActionIds.Clear();
+        auditStoredActionNames.Clear();
         auditNativeActionIds.Clear();
         auditScannedSlots = 0;
         auditCheckedBars = 0;
@@ -184,6 +218,12 @@ public sealed unsafe partial class Plugin
             var module = RaptureHotbarModule.Instance();
             if (module == null || !module->ModuleReady) return;
             var sourceBar = Math.Clamp(config.SelectedHotbar, 1, 10);
+            uint jobId = 0;
+            try { jobId = playerState.ClassJob.RowId; } catch { }
+            // If WrathCombo's native original is not available, do not
+            // mistake a Wrath-adjusted result for a FF14 native transform.
+            auditNativeObserverAvailable = config.NativeTrampolineEnabled &&
+                wrathNativeOriginal != null;
             for (var hb = 1; hb <= 10; hb++)
             {
                 if (hb == sourceBar) continue;
@@ -197,13 +237,23 @@ public sealed unsafe partial class Plugin
                     auditScannedSlots++;
                     var stored = nativeSlot->CommandId;
                     auditStoredActionIds.Add(stored);
+                    var sourceName = AuditActionDetails(stored).Name;
+                    if (!string.IsNullOrWhiteSpace(sourceName))
+                        auditStoredActionNames.Add(AuditNormalizeName(sourceName));
                     // Game-native transformations can display a different ID
                     // from the stored action. May still miss old proc states.
                     var native = GetNativePulseAction(stored);
-                    if (native != 0) auditNativeActionIds.Add(native);
+                    if (native != 0)
+                    {
+                        auditNativeActionIds.Add(native);
+                        if (jobId != 0 && auditNativeObserverAvailable && native != stored)
+                            AuditRememberNativeVariant(jobId, stored, native);
+                    }
                 }
             }
             auditSnapshotReady = true;
+            auditSnapshotJob = jobId;
+            AuditUpdateConfirmedDisplayStates(now, jobId);
         }
         catch (Exception ex)
         {
@@ -211,18 +261,116 @@ public sealed unsafe partial class Plugin
         }
     }
 
+    // Called only from framework thread, not from the native action hook.
+    // Keep bounded memory usage even if a client patch produces unusual IDs.
+    private void AuditRememberNativeVariant(uint job, uint stored, uint native)
+    {
+        if (job == 0 || stored == 0 || native == 0 || stored == native) return;
+        var key = (job, stored);
+        if (!auditObservedNativeVariants.TryGetValue(key, out var variants))
+        {
+            variants = new HashSet<uint>();
+            auditObservedNativeVariants[key] = variants;
+        }
+        if (variants.Count >= AuditMaxNativeVariantsPerSource) return;
+        if (variants.Add(native)) auditRecordedVariantEdges++;
+    }
+
+    private bool AuditMatchesObservedNativeVariant(uint job, uint observed)
+    {
+        // Only an action STILL registered on a non-Wrath bar can satisfy the
+        // audit. This prevents stale learned mappings from concealing missing
+        // skills after a player changes the layout.
+        foreach (var stored in auditStoredActionIds)
+            if (auditObservedNativeVariants.TryGetValue((job, stored), out var variants) &&
+                variants.Contains(observed))
+                return true;
+        return false;
+    }
+
+    // Return -1=waiting, 0=missing placeable, 1/2=exact/native match,
+    // 3=verified base stored, 4=missing assignable base, 5=unassignable,
+    // 6=previously observed native transformation of a currently stored slot.
+    // Mapped transformations must be checked before the *current* native slot
+    // animation, or status can oscillate when a multi-action combo advances.
     private int AuditMatchKind(uint job, uint action)
     {
-        if (!auditSnapshotReady) return -1; // waiting for player/HUD
-        if (auditStoredActionIds.Contains(action)) return 2; // exact stored ID
-        if (auditNativeActionIds.Contains(action)) return 1; // current native transformation
-        // Paradox is unassignable: even after the proc ends, Fire or Blizzard
-        // on ANY non-Wrath source HB is a valid display/assignment source.
-        // This does not suppress truly missing Fire IV or other normal actions.
-        if (AuditIsKnownParadox(job, action) && AuditParadoxSourceRegistered())
-            return 3; // verified stored source of a native transformed action
-        return 0; // missing candidate (not absolute proof)
+        if (!auditSnapshotReady || job == 0 || job != auditSnapshotJob) return -1;
+        if (auditStoredActionIds.Contains(action)) return 2;
+        // Level-96 Paladin upgrades the assignable Requiescat (7383) into
+        // Imperator (36921); the underlying stored hotbar slot may keep 7383.
+        // Do not let Imperator flicker as "missing" when that base is assigned.
+        if (job == 19u && action == 36921u && auditStoredActionIds.Contains(7383u))
+            return 3;
+        // Warrior (ClassJob 21): mastered assignable skills may keep their
+        // pre-upgrade IDs in stored hotbar slots even after an action fires.
+        // Inner Beast (49) -> Fell Cleave (3549) at Lv54.
+        // Steel Cyclone (51) -> Decimate (3550) at Lv60.
+        // Only accept an upgrade when its ACTUAL pre-upgrade slot is assigned
+        // on a non-Wrath hotbar; never blanket-suppress a missing action.
+        if (job == 21u &&
+            ((action == 3549u && auditStoredActionIds.Contains(49u)) ||
+             (action == 3550u && auditStoredActionIds.Contains(51u))))
+            return 3;
+        // A currently displayed or previously observed *native* adjustment
+        // is stronger evidence than an incomplete manually curated source list.
+        // Consult it before the 213 candidate catalog to avoid false "source
+        // missing" warnings for legitimate chained combo replacements.
+        if (auditNativeActionIds.Contains(action)) return 1;
+        if (AuditMatchesObservedNativeVariant(job, action)) return 6;
+        if (AuditTryNonSlotAction(job, action, out var sources))
+        {
+            if (sources.Length == 0) return 5;
+            return AuditHasRegisteredBase(sources) ? 3 : 4;
+        }
+        return 0;
     }
+
+    // Reconcile ONLY after a successful fresh snapshot, not once per ImGui
+    // render. A transient raw mismatch (e.g. combo phase change before the
+    // native-ID observer catches up) must NOT briefly turn a green row red.
+    // - Positive/excluded match: show immediately and reset missing debounce.
+    // - Missing (0/4): hide as 'pending' until sustained for 1.5 seconds AND
+    //   observed in >=5 distinct snapshots. Re-entering a valid match resets
+    //   the entire timer, including on the Nth execution of the same action.
+    private void AuditUpdateConfirmedDisplayStates(long now, uint job)
+    {
+        if (!auditSnapshotReady || job == 0) return;
+        foreach (var entry in auditEntries.Values)
+        {
+            if (entry.Job != job) continue;
+            var raw = AuditMatchKind(job, entry.Action);
+            if (raw is 0 or 4)
+            {
+                if (entry.MissingSinceAt == 0)
+                {
+                    entry.MissingSinceAt = now;
+                    entry.ConsecutiveMissingSnapshots = 1;
+                }
+                else
+                {
+                    entry.ConsecutiveMissingSnapshots++;
+                }
+                entry.ConfirmedDisplayKind =
+                    now - entry.MissingSinceAt >= AuditMissingConfirmationMs &&
+                    entry.ConsecutiveMissingSnapshots >= AuditMissingConfirmationSnapshots
+                        ? raw : -1;
+            }
+            else
+            {
+                entry.MissingSinceAt = 0;
+                entry.ConsecutiveMissingSnapshots = 0;
+                entry.ConfirmedDisplayKind = raw;
+            }
+        }
+    }
+
+    // UI intentionally does not re-evaluate raw per-frame matches: the latest
+    // confirmed snapshot is the only source of display state. This avoids the
+    // old v99 bug where FirstAt grace applied just once in the skill lifetime.
+    private int AuditDisplayMatchKind(SkillAuditEntry item) =>
+        auditSnapshotReady && auditSnapshotJob == item.Job
+            ? item.ConfirmedDisplayKind : -1;
 
     private (string Name, uint Icon) AuditActionDetails(uint id)
     {
@@ -275,13 +423,20 @@ public sealed unsafe partial class Plugin
     {
         if (!ImGui.CollapsingHeader("4. 未登録スキルチェッカー（テスト機能）")) return;
         ImGui.TextWrapped("使用されたスキルを記録し、WrathCombo用HB以外の標準ホットバー1～10に登録されているかチェックします。");
+        ImGui.TextDisabled("判定エンジン v2.0.5.100 ／ 全ジョブのFF14標準変化IDを継続学習（試験機能）");
         ImGui.TextDisabled($"WrathCombo用HB{config.SelectedHotbar}を自動除外 ／ 他の9本を確認（非表示HBも対象）");
+        AuditEnsureNonSlotIdIndex();
+        ImGui.TextDisabled($"ジョブ別ID索引: {auditNonSlotIdIndexStatus}");
+        ImGui.TextDisabled($"ゲーム標準変化の学習: {auditRecordedVariantEdges}組 ／ 元の取得: {(auditNativeObserverAvailable ? "利用可能" : "利用不可（既知ルールで判定）")}");
+        ImGui.TextDisabled("登録照合: 200ms周期・使用直後にも更新 ／ 未登録警告: 1.5秒以上の継続確認後のみ表示");
         ImGui.TextColored(auditHookEnabled
             ? new Vector4(0.45f, 0.90f, 0.56f, 1f)
             : new Vector4(0.90f, 0.75f, 0.45f, 1f), auditStatus);
         if (ImGui.Button("結果をクリア##audit"))
         {
             auditEntries.Clear();
+            auditObservedNativeVariants.Clear();
+            auditRecordedVariantEdges = 0;
             while (auditPendingActions.TryDequeue(out _)) Interlocked.Decrement(ref auditPendingCount);
         }
         ImGui.TextDisabled("ログイン中は自動監視します。結果はメモリにのみ保存され、プラグイン再起動で消えます。");
@@ -294,9 +449,11 @@ public sealed unsafe partial class Plugin
         catch { }
         if (job == 0) job = auditLastJob;
         var entries = auditEntries.Values.Where(x => x.Job == job).ToList();
-        var missing = entries.Count(x => AuditMatchKind(x.Job, x.Action) == 0);
-        var present = entries.Count(x => AuditMatchKind(x.Job, x.Action) > 0);
-        ImGui.Text($"現在ジョブID {job}：記録 {entries.Count}種類 ／ 未登録候補 {missing} ／ 一致 {present}");
+        var missing = entries.Count(x => AuditDisplayMatchKind(x) is 0 or 4);
+        var present = entries.Count(x => AuditDisplayMatchKind(x) is 1 or 2 or 3 or 6);
+        var excluded = entries.Count(x => AuditDisplayMatchKind(x) == 5);
+        var awaiting = entries.Count(x => AuditDisplayMatchKind(x) == -1);
+        ImGui.Text($"現在ジョブID {job}：記録 {entries.Count}種類 ／ 未登録候補 {missing} ／ 一致 {present} ／ 直接登録不可 {excluded} ／ 確認中 {awaiting}");
         ImGui.Checkbox("未登録候補だけ表示##auditMissingOnly", ref auditOnlyMissing);
         if (entries.Count == 0)
         {
@@ -304,30 +461,30 @@ public sealed unsafe partial class Plugin
         }
         else
         {
-            var sorted = entries.OrderBy(x => AuditMatchKind(x.Job, x.Action))
+            var sorted = entries.OrderBy(x => AuditDisplayMatchKind(x))
                 .ThenByDescending(x => x.Count).ThenBy(x => x.Action).ToArray();
             ImGui.BeginChild("##skillAuditResults", new Vector2(0, 200));
             foreach (var item in sorted)
             {
-                var kind = AuditMatchKind(item.Job, item.Action);
-                if (auditOnlyMissing && kind != 0) continue;
-                var missingSource = kind == 0 && AuditIsKnownParadox(item.Job, item.Action);
+                var kind = AuditDisplayMatchKind(item);
+                if (auditOnlyMissing && kind is not (0 or 4)) continue;
+                var knownTransform = AuditTryNonSlotAction(item.Job, item.Action, out var sources);
                 var label = kind switch
                 {
+                    5 => "直接登録不可（対象外）",
+                    4 => "置換元未配置（元スキルを確認）",
                     3 => "置換元あり",
+                    6 => "標準変化を確認済",
                     2 => "登録あり",
                     1 => "変化一致",
-                    0 when missingSource => "置換元を確認",
                     0 => "未登録候補",
                     _ => "照合待ち",
                 };
-                var color = kind == 0 ? new Vector4(1f, 0.55f, 0.40f, 1f)
-                    : kind > 0 ? new Vector4(0.45f, 0.90f, 0.56f, 1f)
+                var color = kind is 0 or 4 ? new Vector4(1f, 0.55f, 0.40f, 1f)
+                    : kind is 1 or 2 or 3 or 6 ? new Vector4(0.45f, 0.90f, 0.56f, 1f)
                     : new Vector4(0.7f, 0.7f, 0.7f, 1f);
-                // For Paradox, report the actual assignable source actions,
-                // rather than telling users to add the unassignable skill.
-                var hint = AuditIsKnownParadox(item.Job, item.Action)
-                    ? (kind == 0 ? "  ← ファイア／ブリザドを確認" : "  ← ファイア／ブリザド")
+                var hint = knownTransform && sources.Length > 0
+                    ? $"  ← 置換元: {string.Join(" / ", sources)}"
                     : string.Empty;
                 var details = AuditActionDetails(item.Action);
                 ImGui.PushID((int)item.Action);
@@ -341,9 +498,11 @@ public sealed unsafe partial class Plugin
             }
             ImGui.EndChild();
         }
-        ImGui.TextDisabled("パラドックスは直接登録不可。対象HBのファイア／ブリザドを照合します（Wrath用HBは除外）。");
+        ImGui.TextDisabled("登録できない置換スキルは元の登録アクションを確認します。元が未検証のものは警告から除外します。");
+        ImGui.TextDisabled("x回数はクライアント実行要求数です。未登録の発生回数ではありません。");
         ImGui.TextWrapped("注意：クライアント側が成功と返した実行要求を記録します。サーバー確定ログではありません。" +
-            "同一ボタンから別スキルへ変化するアクション、レベルによる置換、マクロなどでは未登録候補が誤って出る場合があります。" +
+            "置換対応は日本語PvEジョブガイドに基づく候補リストのため、全アクションの完全保証ではありません。" +
+            "ホットバーに直接置けないアクションと、元スキルの配置漏れを分けて表示します。" +
             "疑似ホットバーのキー発光だけでは記録されず、ホットバー配置・スキル実行・発光設定は変更しません。");
     }
 
@@ -353,6 +512,7 @@ public sealed unsafe partial class Plugin
         try { auditUseActionHook?.Dispose(); } catch { }
         while (auditPendingActions.TryDequeue(out _)) { }
         auditEntries.Clear();
+        auditObservedNativeVariants.Clear();
         auditActionDetailsCache.Clear();
     }
 }
