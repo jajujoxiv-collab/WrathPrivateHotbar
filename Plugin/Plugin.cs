@@ -37,7 +37,7 @@ namespace WrathPrivateHotbar;
 /// Preserves native game hotbar handling outside the selected bar, with a
 /// clickable Dalamud UI and readiness-gated startup hooks.
 /// </summary>
-public sealed unsafe class Plugin : IDalamudPlugin
+public sealed unsafe partial class Plugin : IDalamudPlugin
 {
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly ICommandManager commands;
@@ -866,7 +866,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
         // first becomes true: that is precisely the vulnerable login transition.
         if (!clientState.IsLoggedIn || !playerState.IsLoaded)
         {
-            EndFastHookProbe(); // clean logout is not a crash
+            StopSkillAudit("ログアウト・HUD準備待ち（自動監視）");
+        EndFastHookProbe(); // clean logout is not a crash
             SuspendNativeRenderHooks();
             loginSafetySince = 0;
             nativeObservationReadySince = 0;
@@ -1694,6 +1695,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         // Does not block underlying native hotbar or alpha26 hooks.
         UpdateScreenEventVisibility(uiReady);
         UpdateKeyboundMatchVisibility();
+        UpdateSkillAuditMonitor(uiReady);
         if (hudReady) RefreshNativeInternalHotbarSize();
         ProcessOverlayClick(uiReady);
         // Native proc transitions need frame-rate updates after HUD settles.
@@ -4409,340 +4411,373 @@ public sealed unsafe class Plugin : IDalamudPlugin
         ImGui.TextWrapped("WrathComboを使うホットバーと、FF14標準のホットバーを分けて表示します。");
         ImGui.TextDisabled("対象外のホットバーは、元のアイコン・説明・スキル実行を維持します。");
         ImGui.Separator();
-
-        ImGui.Text("WrathComboを使用するホットバー");
-        int bar = config.SelectedHotbar;
-        if (ImGui.BeginCombo("##sourceHotbar", $"ホットバー {bar}"))
+        if (ImGui.CollapsingHeader("1. ホットバーの指定・発光先", ImGuiTreeNodeFlags.DefaultOpen))
         {
-            for (int i = 1; i <= 10; i++)
+            ImGui.Text("WrathComboを使用するホットバー");
+            int bar = config.SelectedHotbar;
+            if (ImGui.BeginCombo("##sourceHotbar", $"ホットバー {bar}"))
             {
-                if (ImGui.Selectable($"ホットバー {i}", i == bar))
+                for (int i = 1; i <= 10; i++)
                 {
-                    config.SelectedHotbar = i;
-                    // The action-source bar must never be a native pulse target.
-                    config.PulseTargetHotbars = (config.PulseTargetHotbars ?? [])
-                        .Where(x => x != i).ToArray();
+                    if (ImGui.Selectable($"ホットバー {i}", i == bar))
+                    {
+                        config.SelectedHotbar = i;
+                        // The action-source bar must never be a native pulse target.
+                        config.PulseTargetHotbars = (config.PulseTargetHotbars ?? [])
+                            .Where(x => x != i).ToArray();
+                        lastPulseTargetBar = 0;
+                        lastPulseTargetSlot = 0;
+                        Save();
+                    }
+                }
+                ImGui.EndCombo();
+            }
+            ImGui.TextDisabled("選択したホットバーだけWrathComboの可変表示を使用します。");
+
+
+            ImGui.Spacing();
+            ImGui.Text("選択した元ホットバーの表示");
+            bool isHidden = locallyHiddenHotbars.Contains(config.SelectedHotbar);
+            if (ImGui.Button(isHidden ? "元のホットバーを表示する" : "元のホットバーを非表示にする"))
+                ToggleSelectedHotbarVisibility();
+            ImGui.TextDisabled("この非表示設定は保存され、次回ログイン時にも自動適用されます。");
+            ImGui.TextDisabled("FF14本体のHUD設定は変更しません。プラグイン停止時は再表示します。");
+
+
+            ImGui.Text("スキルの押下・発光演出");
+            bool pulse = config.PulseEnabled;
+            if (ImGui.Checkbox("押しているキーに対応するスキルを発光させる", ref pulse))
+            {
+                config.PulseEnabled = pulse;
+                Save();
+            }
+            ImGui.Spacing();
+            ImGui.Text("押下演出を表示する標準ホットバー");
+            ImGui.TextWrapped("優先して光らせたいホットバーを選択してください（例：HB3・HB4）。"
+                + " 指定先に該当スキルがなければ、表示中のほかのホットバーから探して発光させます。");
+            var targetHotbars = ConfiguredPulseTargets;
+            for (int targetBar = 1; targetBar <= 10; targetBar++)
+            {
+                bool isCurrent = targetBar == config.SelectedHotbar;
+                bool checkedTarget = Array.IndexOf(targetHotbars, targetBar) >= 0;
+                if (isCurrent) ImGui.BeginDisabled();
+                if (ImGui.Checkbox($"HB{targetBar}##pulseTarget{targetBar}", ref checkedTarget) && !isCurrent)
+                {
+                    var updateTargets = new List<int>(targetHotbars);
+                    updateTargets.RemoveAll(x => x == targetBar);
+                    if (checkedTarget) updateTargets.Add(targetBar);
+                    // Stable priority across sessions: smaller hotbar number first.
+                    updateTargets.Sort();
+                    config.PulseTargetHotbars = updateTargets.ToArray();
+                    targetHotbars = config.PulseTargetHotbars;
                     lastPulseTargetBar = 0;
                     lastPulseTargetSlot = 0;
                     Save();
                 }
+                if (isCurrent) ImGui.EndDisabled();
+                if (targetBar % 5 != 0) ImGui.SameLine();
             }
-            ImGui.EndCombo();
-        }
-        ImGui.TextDisabled("選択したホットバーだけWrathComboの可変表示を使用します。");
-
-        ImGui.Separator();
-        ImGui.Text("疑似ホットバー");
-        ImGui.TextDisabled(keybindReadStatus);
-        bool show = config.InternalHotbarEnabled;
-        if (ImGui.Checkbox("疑似ホットバーを表示する", ref show))
-        {
-            config.InternalHotbarEnabled = show;
-            config.OverlayEnabled = false;
-            Save();
-        }
-        bool click = config.OverlayClickActions;
-        if (ImGui.Checkbox("アイコンのクリックでスキル・アイテムを使用する", ref click))
-        {
-            config.OverlayClickActions = click;
-            Save();
-        }
-        bool locked = config.InternalHotbarLocked;
-        if (ImGui.Checkbox("位置とサイズを固定する", ref locked))
-        {
-            config.InternalHotbarLocked = locked;
-            Save();
-        }
-        if (ImGui.Button(config.InternalHotbarLocked ? "編集モードにする" : "位置とサイズを固定"))
-        {
-            config.InternalHotbarLocked = !config.InternalHotbarLocked;
-            Save();
-        }
-        ImGui.TextDisabled("画面右端の鍵でも切替可能。解除中は + / - と移動用つまみが表示されます。");
-
-        int layoutIndex = Array.IndexOf(layouts, config.OverlayLayout);
-        if (layoutIndex < 0) layoutIndex = 0;
-        if (ImGui.Combo("アイコンの並び方", ref layoutIndex, layouts, layouts.Length))
-        {
-            config.OverlayLayout = layouts[layoutIndex];
-            Save();
-        }
-        int iconSize = config.InternalHotbarCellSize;
-        if (ImGui.SliderInt("アイコンの大きさ (px)", ref iconSize, 24, 200))
-            ApplyManualInternalCellSize(iconSize);
-        int gap = config.InternalHotbarCellGap;
-        if (ImGui.SliderInt("アイコンの間隔 (px)", ref gap, 0, 20))
-            ApplyManualInternalCellGap(gap);
-        ImGui.TextDisabled("純正ホットバーに合わせて調整した値を自動保存します。");
-
-        bool isHidden = locallyHiddenHotbars.Contains(config.SelectedHotbar);
-        if (ImGui.Button(isHidden ? "元のホットバーを表示する" : "元のホットバーを非表示にする"))
-            ToggleSelectedHotbarVisibility();
-        ImGui.TextDisabled("この非表示設定は保存され、次回ログイン時にも自動適用されます。");
-        ImGui.TextDisabled("FF14本体のHUD設定は変更しません。プラグイン停止時は再表示します。");
-
-        bool hideNpc = config.HideDuringNpcDialogue;
-        if (ImGui.Checkbox("NPCとの会話中は疑似ホットバーを隠す", ref hideNpc))
-        {
-            config.HideDuringNpcDialogue = hideNpc;
-            Save();
-        }
-        ImGui.TextDisabled("会話・選択肢・確認画面が開いている間は自動で隠れ、終了後に戻ります。");
-        bool hideCutscenes = config.HideDuringCutscenes;
-        if (ImGui.Checkbox("カットシーン・ムービー・イベント中は疑似ホットバーを隠す", ref hideCutscenes))
-        {
-            config.HideDuringCutscenes = hideCutscenes;
-            Save();
-        }
-        ImGui.TextDisabled("イベント演出中も自動で隠れ、通常操作に戻ると再表示します。");
-
-        // Keybound Brawler match-only auto-hide is always active (Territory 1359).
-        // No settings or manual territory registration are needed.
-
-        ImGui.Separator();
-        ImGui.Text("リキャスト表示");
-        bool cooldownEnabled = config.OverlayCooldownEnabled;
-        if (ImGui.Checkbox("リキャスト情報を取得する", ref cooldownEnabled))
-        {
-            config.OverlayCooldownEnabled = cooldownEnabled;
-            Save();
-        }
-        ImGui.TextDisabled("基本設定ではリキャスト中もアイコンの明るさを維持します。");
-        var recastProgress = config.NativeCooldownProgressEnabled;
-        if (ImGui.Checkbox("リキャスト進行状況をアイコンの縁に表示する（暗転なし）", ref recastProgress))
-        {
-            config.NativeCooldownProgressEnabled = recastProgress;
-            Save();
-        }
-        var recastSector = config.NativeCooldownSectorEnabled;
-        if (ImGui.Checkbox("純正風の扇形リキャスト暗転も使用する（初期OFF）", ref recastSector))
-        {
-            config.NativeCooldownSectorEnabled = recastSector;
-            Save();
-        }
-        ImGui.TextDisabled("従来の黒塗りなしが標準。扇形は必要なときだけ有効化できます。");
-        bool showSeconds = config.OverlayCooldownNumbers;
-        if (ImGui.Checkbox("残り秒数を表示する", ref showSeconds))
-        {
-            config.OverlayCooldownNumbers = showSeconds;
-            Save();
-        }
-        bool hideShort = config.OverlayHideShortRecast;
-        if (ImGui.Checkbox("3秒以下の短いリキャストを省略する", ref hideShort))
-        {
-            config.OverlayHideShortRecast = hideShort;
-            Save();
-        }
-
-        ImGui.Separator();
-        ImGui.Text("スキルアイコンの純正風アニメーション");
-        var pressFeedback = config.NativePressFeedbackEnabled;
-        if (ImGui.Checkbox("スキル入力時にアイコンを押し込み・フラッシュさせる", ref pressFeedback))
-        {
-            config.NativePressFeedbackEnabled = pressFeedback;
-            Save();
-        }
-        var procHighlight = config.NativeProcHighlightEnabled;
-        if (ImGui.Checkbox("FF14本体から取得できたProc強調演出を反映する", ref procHighlight))
-        {
-            config.NativeProcHighlightEnabled = procHighlight;
-            Save();
-        }
-        ImGui.TextDisabled("純正描画情報が取得できない場合は安全な通常表示に戻ります。");
-        var actionCost = config.NativeActionCostEnabled;
-        if (ImGui.Checkbox("スキルのMP/CP/GP消費数値をアイコン左下に表示する", ref actionCost))
-        {
-            config.NativeActionCostEnabled = actionCost;
-            Save();
-        }
-        ImGui.TextDisabled("FF14の実行時消費量を参照します。変化スキルや一部の特殊コストは実機で確認してください。");
-
-        ImGui.Separator();
-        ImGui.Text("キー操作と発光");
-        bool pulse = config.PulseEnabled;
-        if (ImGui.Checkbox("押しているキーに対応するスキルを発光させる", ref pulse))
-        {
-            config.PulseEnabled = pulse;
-            Save();
-        }
-        ImGui.Spacing();
-        ImGui.Text("押下演出を表示する標準ホットバー");
-        ImGui.TextWrapped("優先して光らせたいホットバーを選択してください（例：HB3・HB4）。"
-            + " 指定先に該当スキルがなければ、表示中のほかのホットバーから探して発光させます。");
-        var targetHotbars = ConfiguredPulseTargets;
-        for (int targetBar = 1; targetBar <= 10; targetBar++)
-        {
-            bool isCurrent = targetBar == config.SelectedHotbar;
-            bool checkedTarget = Array.IndexOf(targetHotbars, targetBar) >= 0;
-            if (isCurrent) ImGui.BeginDisabled();
-            if (ImGui.Checkbox($"HB{targetBar}##pulseTarget{targetBar}", ref checkedTarget) && !isCurrent)
+            if (ImGui.Button("表示先を自動選択に戻す##pulseTargetReset"))
             {
-                var updateTargets = new List<int>(targetHotbars);
-                updateTargets.RemoveAll(x => x == targetBar);
-                if (checkedTarget) updateTargets.Add(targetBar);
-                // Stable priority across sessions: smaller hotbar number first.
-                updateTargets.Sort();
-                config.PulseTargetHotbars = updateTargets.ToArray();
-                targetHotbars = config.PulseTargetHotbars;
+                config.PulseTargetHotbars = [];
                 lastPulseTargetBar = 0;
                 lastPulseTargetSlot = 0;
                 Save();
             }
-            if (isCurrent) ImGui.EndDisabled();
-            if (targetBar % 5 != 0) ImGui.SameLine();
+            ImGui.TextDisabled(targetHotbars.Length == 0
+                ? "現在：従来の自動選択（スキルが一致する標準ホットバーから選択）"
+                : $"現在：HB{string.Join(" → HB", targetHotbars)} を優先 → 未一致ならほかの表示中HBへ");
+            string pulseTargetKind = targetHotbars.Length == 0 ? "自動" :
+                Array.IndexOf(targetHotbars, lastPulseTargetBar) >= 0 ? "指定先" : "代替先";
+            ImGui.TextDisabled(lastPulseTargetBar > 0
+                ? $"直近の疑似発光先：HB{lastPulseTargetBar} スロット{lastPulseTargetSlot}（{pulseTargetKind}）"
+                : "直近の疑似発光先：なし / 未一致");
+            ImGui.TextWrapped("注意：本機能はプラグイン側で追加する押下演出の表示先を選びます。"
+                + "FF14本体のキー操作による演出は消せません。スキル使用やリキャストの挙動は変わりません。");
+
+
         }
-        if (ImGui.Button("表示先を自動選択に戻す##pulseTargetReset"))
+
+        ImGui.Separator();
+        if (ImGui.CollapsingHeader("2. 疑似ホットバーの表示・配置", ImGuiTreeNodeFlags.DefaultOpen))
         {
-            config.PulseTargetHotbars = [];
-            lastPulseTargetBar = 0;
-            lastPulseTargetSlot = 0;
-            Save();
-        }
-        ImGui.TextDisabled(targetHotbars.Length == 0
-            ? "現在：従来の自動選択（スキルが一致する標準ホットバーから選択）"
-            : $"現在：HB{string.Join(" → HB", targetHotbars)} を優先 → 未一致ならほかの表示中HBへ");
-        string pulseTargetKind = targetHotbars.Length == 0 ? "自動" :
-            Array.IndexOf(targetHotbars, lastPulseTargetBar) >= 0 ? "指定先" : "代替先";
-        ImGui.TextDisabled(lastPulseTargetBar > 0
-            ? $"直近の疑似発光先：HB{lastPulseTargetBar} スロット{lastPulseTargetSlot}（{pulseTargetKind}）"
-            : "直近の疑似発光先：なし / 未一致");
-        ImGui.TextWrapped("注意：本機能はプラグイン側で追加する押下演出の表示先を選びます。"
-            + "FF14本体のキー操作による演出は消せません。スキル使用やリキャストの挙動は変わりません。");
-        if (ImGui.CollapsingHeader("キー割り当てを変更する"))
-        {
-            ImGui.TextWrapped("スロットごとに発光に使用するキーを指定します。Shift/Ctrl/Altとの組み合わせは設定できません。");
-            var keys = EffectiveKeyCodes;
-            for (int slotIndex = 0; slotIndex < 12; slotIndex++)
+            ImGui.Text("疑似ホットバー");
+            ImGui.TextDisabled(keybindReadStatus);
+            bool show = config.InternalHotbarEnabled;
+            if (ImGui.Checkbox("疑似ホットバーを表示する", ref show))
             {
-                int key = keys[slotIndex];
-                var label = Array.Find(KeyChoices, choice => choice.Code == key).Label ?? $"VK 0x{key:X2}";
-                if (ImGui.BeginCombo($"スロット {slotIndex + 1}##key{slotIndex}", label))
+                config.InternalHotbarEnabled = show;
+                config.OverlayEnabled = false;
+                Save();
+            }
+            bool click = config.OverlayClickActions;
+            if (ImGui.Checkbox("アイコンのクリックでスキル・アイテムを使用する", ref click))
+            {
+                config.OverlayClickActions = click;
+                Save();
+            }
+            bool locked = config.InternalHotbarLocked;
+            if (ImGui.Checkbox("位置とサイズを固定する", ref locked))
+            {
+                config.InternalHotbarLocked = locked;
+                Save();
+            }
+            if (ImGui.Button(config.InternalHotbarLocked ? "編集モードにする" : "位置とサイズを固定"))
+            {
+                config.InternalHotbarLocked = !config.InternalHotbarLocked;
+                Save();
+            }
+            ImGui.TextDisabled("画面右端の鍵でも切替可能。解除中は + / - と移動用つまみが表示されます。");
+
+            int layoutIndex = Array.IndexOf(layouts, config.OverlayLayout);
+            if (layoutIndex < 0) layoutIndex = 0;
+            if (ImGui.Combo("アイコンの並び方", ref layoutIndex, layouts, layouts.Length))
+            {
+                config.OverlayLayout = layouts[layoutIndex];
+                Save();
+            }
+            int iconSize = config.InternalHotbarCellSize;
+            if (ImGui.SliderInt("アイコンの大きさ (px)", ref iconSize, 24, 200))
+                ApplyManualInternalCellSize(iconSize);
+            int gap = config.InternalHotbarCellGap;
+            if (ImGui.SliderInt("アイコンの間隔 (px)", ref gap, 0, 20))
+                ApplyManualInternalCellGap(gap);
+            ImGui.TextDisabled("純正ホットバーに合わせて調整した値を自動保存します。");
+
+
+            bool hideNpc = config.HideDuringNpcDialogue;
+            if (ImGui.Checkbox("NPCとの会話中は疑似ホットバーを隠す", ref hideNpc))
+            {
+                config.HideDuringNpcDialogue = hideNpc;
+                Save();
+            }
+            ImGui.TextDisabled("会話・選択肢・確認画面が開いている間は自動で隠れ、終了後に戻ります。");
+            bool hideCutscenes = config.HideDuringCutscenes;
+            if (ImGui.Checkbox("カットシーン・ムービー・イベント中は疑似ホットバーを隠す", ref hideCutscenes))
+            {
+                config.HideDuringCutscenes = hideCutscenes;
+                Save();
+            }
+            ImGui.TextDisabled("イベント演出中も自動で隠れ、通常操作に戻ると再表示します。");
+
+            // Keybound Brawler match-only auto-hide is always active (Territory 1359).
+            // No settings or manual territory registration are needed.
+
+
+        }
+
+        ImGui.Separator();
+        if (ImGui.CollapsingHeader("3. スキルアイコン・リキャスト表示"))
+        {
+            ImGui.Text("スキルアイコンの純正風アニメーション");
+            var pressFeedback = config.NativePressFeedbackEnabled;
+            if (ImGui.Checkbox("スキル入力時にアイコンを押し込み・フラッシュさせる", ref pressFeedback))
+            {
+                config.NativePressFeedbackEnabled = pressFeedback;
+                Save();
+            }
+            var procHighlight = config.NativeProcHighlightEnabled;
+            if (ImGui.Checkbox("FF14本体から取得できたProc強調演出を反映する", ref procHighlight))
+            {
+                config.NativeProcHighlightEnabled = procHighlight;
+                Save();
+            }
+            ImGui.TextDisabled("純正描画情報が取得できない場合は安全な通常表示に戻ります。");
+            var actionCost = config.NativeActionCostEnabled;
+            if (ImGui.Checkbox("スキルのMP/CP/GP消費数値をアイコン左下に表示する", ref actionCost))
+            {
+                config.NativeActionCostEnabled = actionCost;
+                Save();
+            }
+            ImGui.TextDisabled("FF14の実行時消費量を参照します。変化スキルや一部の特殊コストは実機で確認してください。");
+
+
+            ImGui.Text("リキャスト表示");
+            bool cooldownEnabled = config.OverlayCooldownEnabled;
+            if (ImGui.Checkbox("リキャスト情報を取得する", ref cooldownEnabled))
+            {
+                config.OverlayCooldownEnabled = cooldownEnabled;
+                Save();
+            }
+            ImGui.TextDisabled("基本設定ではリキャスト中もアイコンの明るさを維持します。");
+            var recastProgress = config.NativeCooldownProgressEnabled;
+            if (ImGui.Checkbox("リキャスト進行状況をアイコンの縁に表示する（暗転なし）", ref recastProgress))
+            {
+                config.NativeCooldownProgressEnabled = recastProgress;
+                Save();
+            }
+            var recastSector = config.NativeCooldownSectorEnabled;
+            if (ImGui.Checkbox("純正風の扇形リキャスト暗転も使用する（初期OFF）", ref recastSector))
+            {
+                config.NativeCooldownSectorEnabled = recastSector;
+                Save();
+            }
+            ImGui.TextDisabled("従来の黒塗りなしが標準。扇形は必要なときだけ有効化できます。");
+            bool showSeconds = config.OverlayCooldownNumbers;
+            if (ImGui.Checkbox("残り秒数を表示する", ref showSeconds))
+            {
+                config.OverlayCooldownNumbers = showSeconds;
+                Save();
+            }
+            bool hideShort = config.OverlayHideShortRecast;
+            if (ImGui.Checkbox("3秒以下の短いリキャストを省略する", ref hideShort))
+            {
+                config.OverlayHideShortRecast = hideShort;
+                Save();
+            }
+
+
+        }
+
+        ImGui.Separator();
+        DrawSkillAuditSettings();
+
+        ImGui.Separator();
+        if (ImGui.CollapsingHeader("5. キー操作・連打・発光の詳細"))
+        {
+            if (ImGui.CollapsingHeader("キー割り当てを変更する"))
+            {
+                ImGui.TextWrapped("スロットごとに発光に使用するキーを指定します。Shift/Ctrl/Altとの組み合わせは設定できません。");
+                var keys = EffectiveKeyCodes;
+                for (int slotIndex = 0; slotIndex < 12; slotIndex++)
                 {
-                    foreach (var choice in KeyChoices)
+                    int key = keys[slotIndex];
+                    var label = Array.Find(KeyChoices, choice => choice.Code == key).Label ?? $"VK 0x{key:X2}";
+                    if (ImGui.BeginCombo($"スロット {slotIndex + 1}##key{slotIndex}", label))
                     {
-                        if (!ImGui.Selectable(choice.Label + $"##{slotIndex}-{choice.Code}", key == choice.Code)) continue;
-                        var changed = (int[])keys.Clone();
-                        changed[slotIndex] = choice.Code;
-                        config.PulseKeyCodes = changed;
-                        keys = changed;
-                        activePulseSource = -1;
-                        Array.Clear(previousKeyDown);
+                        foreach (var choice in KeyChoices)
+                        {
+                            if (!ImGui.Selectable(choice.Label + $"##{slotIndex}-{choice.Code}", key == choice.Code)) continue;
+                            var changed = (int[])keys.Clone();
+                            changed[slotIndex] = choice.Code;
+                            config.PulseKeyCodes = changed;
+                            keys = changed;
+                            activePulseSource = -1;
+                            Array.Clear(previousKeyDown);
+                            Save();
+                        }
+                        ImGui.EndCombo();
+                    }
+                }
+                if (ImGui.Button("キーを初期配置に戻す"))
+                {
+                    config.PulseKeyCodes = (int[])DefaultKeyCodes.Clone();
+                    activePulseSource = -1;
+                    Array.Clear(previousKeyDown);
+                    Save();
+                }
+            }
+
+
+            ImGui.Text("ReActionを使わない人向け：長押し連打");
+            var turbo = config.BuiltInTurboEnabled;
+            if (ImGui.Checkbox("内蔵Turbo（選択ホットバーの通常スキルだけ）", ref turbo))
+            {
+                config.BuiltInTurboEnabled = turbo;
+                ResetBuiltInTurbo();
+                Save();
+            }
+            ImGui.TextWrapped("ReAction未導入者向け。初期OFF。キーを押した最初の1回はFF14本体に任せ、押しっぱなしの間だけ追加で実行要求します。") ;
+            var turboInterval = config.BuiltInTurboIntervalMs;
+            if (ImGui.SliderInt("連打間隔 (ms)##builtInTurbo", ref turboInterval, 50, 500))
+            {
+                config.BuiltInTurboIntervalMs = turboInterval;
+                ResetBuiltInTurbo();
+                Save();
+            }
+            var turboDelay = config.BuiltInTurboStartDelayMs;
+            if (ImGui.SliderInt("追加開始遅延 (ms)##builtInTurbo", ref turboDelay, 0, 500))
+            {
+                config.BuiltInTurboStartDelayMs = turboDelay;
+                ResetBuiltInTurbo();
+                Save();
+            }
+            var turboOutOfCombat = config.BuiltInTurboOutOfCombat;
+            if (ImGui.Checkbox("戦闘外でも長押し連打を使う", ref turboOutOfCombat))
+            {
+                config.BuiltInTurboOutOfCombat = turboOutOfCombat;
+                ResetBuiltInTurbo();
+                Save();
+            }
+            ImGui.TextDisabled(turboStatus);
+            ImGui.TextWrapped("対象：上で設定したスロット1～12の単独キー・通常アクションだけ。Shift/Ctrl/Alt、クロスホットバー、マクロ、アイテムは非対応。FF14のキー設定も一致させてください。");
+            ImGui.TextWrapped("ReActionがロードされていると自動停止します。両方の連打機能は併用しません。チャット入力中・NPC会話中・非アクティブ時にも停止します。");
+
+
+            if (ImGui.CollapsingHeader("発光間隔の詳細設定"))
+            {
+                bool random = config.RandomPulse;
+                if (ImGui.RadioButton("ランダム間隔", random)) { config.RandomPulse = true; Save(); }
+                ImGui.SameLine();
+                if (ImGui.RadioButton("一定間隔", !random)) { config.RandomPulse = false; Save(); }
+                if (config.RandomPulse)
+                {
+                    int min = config.PulseMinMs;
+                    int max = config.PulseMaxMs;
+                    if (ImGui.SliderInt("最短間隔 (ms)", ref min, 50, 500))
+                    {
+                        config.PulseMinMs = Math.Min(min, config.PulseMaxMs);
                         Save();
                     }
-                    ImGui.EndCombo();
+                    if (ImGui.SliderInt("最長間隔 (ms)", ref max, 50, 500))
+                    {
+                        config.PulseMaxMs = Math.Max(max, config.PulseMinMs);
+                        Save();
+                    }
+                }
+                else
+                {
+                    int fixedMs = config.FixedPulseMs;
+                    if (ImGui.SliderInt("間隔 (ms)", ref fixedMs, 50, 500))
+                    {
+                        config.FixedPulseMs = fixedMs;
+                        Save();
+                    }
                 }
             }
-            if (ImGui.Button("キーを初期配置に戻す"))
+
+
+            if (ImGui.CollapsingHeader("純正操作音と発光の同期"))
             {
-                config.PulseKeyCodes = (int[])DefaultKeyCodes.Clone();
-                activePulseSource = -1;
-                Array.Clear(previousKeyDown);
-                Save();
+                ImGui.TextWrapped("長押し連打中のFF14純正入力音（ID12）を抑え、疑似ホットバーの発光に合わせて同じゲーム音を再生します。入力や実際のアクションは変更しません。");
+                var sync = config.SoundSyncNativeOnPulse;
+                if (ImGui.Checkbox("純正操作音を発光と同期する", ref sync))
+                {
+                    config.SoundSyncNativeOnPulse = sync;
+                    if (!sync) Volatile.Write(ref audioHeldKey, 0);
+                    Save();
+                }
+                ImGui.TextDisabled("FF14の更新後などに音が二重に聞こえる場合はOFFにしてください。");
+                if (sync && audioSyncStatus != "純正操作音の同期処理が有効です" &&
+                    audioSyncStatus != "OFF（通常のFF14サウンド）")
+                    ImGui.TextWrapped(audioSyncStatus);
             }
+
+
+            if (ImGui.CollapsingHeader("連打・発光間隔の計測（実測値）"))
+            {
+                ImGui.TextWrapped("設定したmsではなく、このプラグインが観測できたイベント間隔を表示します。直近最大32区間の統計です。");
+                DrawIntervalProbe("手動キー連打", physicalTapIntervals);
+                ImGui.TextDisabled($"対象: HB{config.SelectedHotbar} の割当キー。同じキーを離して再度押した時のみ計測（同じキー内で比較）。");
+                DrawIntervalProbe("疑似ホットバー発光", visualPulseIntervals);
+                ImGui.TextDisabled("発光更新の実行間隔。発光の周期であり、スキルの実行周期ではありません。");
+                DrawIntervalProbe("内蔵Turbo実行要求", turboRequestIntervals);
+                ImGui.TextDisabled("内蔵Turboの実行要求間隔。FF14のスキル成功回数・GCDとは別です。");
+                ImGui.TextWrapped("外部のReAction内部連打、キー押しっぱなしのOS自動リピート、フレーム間に完結した極短い入力は測定できません。");
+                if (ImGui.Button("連打計測をリセット"))
+                {
+                    physicalTapIntervals.Clear();
+                    visualPulseIntervals.Clear();
+                    turboRequestIntervals.Clear();
+                    physicalMonitorLastSlot = -1;
+                }
+            }
+
+
         }
+
         ImGui.Separator();
-        if (ImGui.CollapsingHeader("連打・発光間隔の計測（実測値）", ImGuiTreeNodeFlags.DefaultOpen))
-        {
-            ImGui.TextWrapped("設定したmsではなく、このプラグインが観測できたイベント間隔を表示します。直近最大32区間の統計です。");
-            DrawIntervalProbe("手動キー連打", physicalTapIntervals);
-            ImGui.TextDisabled($"対象: HB{config.SelectedHotbar} の割当キー。同じキーを離して再度押した時のみ計測（同じキー内で比較）。");
-            DrawIntervalProbe("疑似ホットバー発光", visualPulseIntervals);
-            ImGui.TextDisabled("発光更新の実行間隔。発光の周期であり、スキルの実行周期ではありません。");
-            DrawIntervalProbe("内蔵Turbo実行要求", turboRequestIntervals);
-            ImGui.TextDisabled("内蔵Turboの実行要求間隔。FF14のスキル成功回数・GCDとは別です。");
-            ImGui.TextWrapped("外部のReAction内部連打、キー押しっぱなしのOS自動リピート、フレーム間に完結した極短い入力は測定できません。");
-            if (ImGui.Button("連打計測をリセット"))
-            {
-                physicalTapIntervals.Clear();
-                visualPulseIntervals.Clear();
-                turboRequestIntervals.Clear();
-                physicalMonitorLastSlot = -1;
-            }
-        }
-        ImGui.Separator();
-        ImGui.Text("ReActionを使わない人向け：長押し連打");
-        var turbo = config.BuiltInTurboEnabled;
-        if (ImGui.Checkbox("内蔵Turbo（選択ホットバーの通常スキルだけ）", ref turbo))
-        {
-            config.BuiltInTurboEnabled = turbo;
-            ResetBuiltInTurbo();
-            Save();
-        }
-        ImGui.TextWrapped("ReAction未導入者向け。初期OFF。キーを押した最初の1回はFF14本体に任せ、押しっぱなしの間だけ追加で実行要求します。") ;
-        var turboInterval = config.BuiltInTurboIntervalMs;
-        if (ImGui.SliderInt("連打間隔 (ms)##builtInTurbo", ref turboInterval, 50, 500))
-        {
-            config.BuiltInTurboIntervalMs = turboInterval;
-            ResetBuiltInTurbo();
-            Save();
-        }
-        var turboDelay = config.BuiltInTurboStartDelayMs;
-        if (ImGui.SliderInt("追加開始遅延 (ms)##builtInTurbo", ref turboDelay, 0, 500))
-        {
-            config.BuiltInTurboStartDelayMs = turboDelay;
-            ResetBuiltInTurbo();
-            Save();
-        }
-        var turboOutOfCombat = config.BuiltInTurboOutOfCombat;
-        if (ImGui.Checkbox("戦闘外でも長押し連打を使う", ref turboOutOfCombat))
-        {
-            config.BuiltInTurboOutOfCombat = turboOutOfCombat;
-            ResetBuiltInTurbo();
-            Save();
-        }
-        ImGui.TextDisabled(turboStatus);
-        ImGui.TextWrapped("対象：上で設定したスロット1～12の単独キー・通常アクションだけ。Shift/Ctrl/Alt、クロスホットバー、マクロ、アイテムは非対応。FF14のキー設定も一致させてください。");
-        ImGui.TextWrapped("ReActionがロードされていると自動停止します。両方の連打機能は併用しません。チャット入力中・NPC会話中・非アクティブ時にも停止します。");
-
-        if (ImGui.CollapsingHeader("発光間隔の詳細設定"))
-        {
-            bool random = config.RandomPulse;
-            if (ImGui.RadioButton("ランダム間隔", random)) { config.RandomPulse = true; Save(); }
-            ImGui.SameLine();
-            if (ImGui.RadioButton("一定間隔", !random)) { config.RandomPulse = false; Save(); }
-            if (config.RandomPulse)
-            {
-                int min = config.PulseMinMs;
-                int max = config.PulseMaxMs;
-                if (ImGui.SliderInt("最短間隔 (ms)", ref min, 50, 500))
-                {
-                    config.PulseMinMs = Math.Min(min, config.PulseMaxMs);
-                    Save();
-                }
-                if (ImGui.SliderInt("最長間隔 (ms)", ref max, 50, 500))
-                {
-                    config.PulseMaxMs = Math.Max(max, config.PulseMinMs);
-                    Save();
-                }
-            }
-            else
-            {
-                int fixedMs = config.FixedPulseMs;
-                if (ImGui.SliderInt("間隔 (ms)", ref fixedMs, 50, 500))
-                {
-                    config.FixedPulseMs = fixedMs;
-                    Save();
-                }
-            }
-        }
-
-        if (ImGui.CollapsingHeader("純正操作音と発光の同期"))
-        {
-            ImGui.TextWrapped("長押し連打中のFF14純正入力音（ID12）を抑え、疑似ホットバーの発光に合わせて同じゲーム音を再生します。入力や実際のアクションは変更しません。");
-            var sync = config.SoundSyncNativeOnPulse;
-            if (ImGui.Checkbox("純正操作音を発光と同期する", ref sync))
-            {
-                config.SoundSyncNativeOnPulse = sync;
-                if (!sync) Volatile.Write(ref audioHeldKey, 0);
-                Save();
-            }
-            ImGui.TextDisabled("FF14の更新後などに音が二重に聞こえる場合はOFFにしてください。");
-            if (sync && audioSyncStatus != "純正操作音の同期処理が有効です" &&
-                audioSyncStatus != "OFF（通常のFF14サウンド）")
-                ImGui.TextWrapped(audioSyncStatus);
-        }
-
-        if (ImGui.CollapsingHeader("起動に問題がある場合"))
+        if (ImGui.CollapsingHeader("6. 起動・トラブル対応"))
         {
             bool safeStartup = !config.FastNativeHookStartup;
             if (ImGui.Checkbox("安定優先モード（起動時の準備待ちを長くする）", ref safeStartup))
@@ -4758,6 +4793,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             ImGui.TextDisabled($"スキル説明の補正: {tooltipIsolationStatus}");
         }
 
+
         ImGui.Separator();
         ImGui.TextDisabled("/wprivate config で設定を開く（固定・解除は設定画面や鍵アイコンから操作）");
         ImGui.TextDisabled("配信で非表示になるかは録画方式によります。Dalamud内部描画だけでは自動で隠れません。");
@@ -4766,6 +4802,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
+        DisposeSkillAudit();
         EndFastHookProbe();
         // When unloading in-game, restore UI nodes, not the persisted opt-in.
         // Next plugin load will re-apply the saved choice after normal HUD readiness.
